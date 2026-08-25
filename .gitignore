@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.spec
+!AutoFTBQ-v2.spec
+
+# Project
+.reasonix/
+quests/
+questbook_output/
+_playstyle_cache/
+playstyle_data/playstyle_raw/
+config.json
+.env
+.env.*
+!.env.example
+logs/
+
+# Reference copies (not project code)
+FTB-Quests-source/
+FTB-Quests-*.zip
+example_all/
+example_all.zip
+dist_pack/
+_example_extracted/
+
+# Misc junk
+nul
+*.snbt
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cache
+_modrinth_cache/
+_wiki_cache/
+.autoftbq_cache/
+.autoftbq_workspace/
+polish_debug/
+reasonix.toml

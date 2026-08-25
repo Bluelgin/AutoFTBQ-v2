@@ -1,0 +1,417 @@
+"""Editable project model shared by the v2 UI and agent tools."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field
+import json
+import uuid
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:10]}"
+
+
+@dataclass
+class Task:
+    type: str = "checkmark"
+    target: str = ""
+    count: int = 1
+
+
+@dataclass
+class Quest:
+    id: str = field(default_factory=lambda: new_id("quest"))
+    title: str = "新任务"
+    subtitle: str = ""
+    icon: str = ""
+    description: list[str] = field(default_factory=list)
+    tasks: list[Task] = field(default_factory=lambda: [Task()])
+    rewards: list[dict] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
+    x: float = 0.0
+    y: float = 0.0
+    shape: str = "circle"
+
+
+@dataclass
+class Chapter:
+    id: str = field(default_factory=lambda: new_id("chapter"))
+    title: str = "新章节"
+    icon: str = "minecraft:book"
+    quests: list[Quest] = field(default_factory=list)
+
+
+@dataclass
+class QuestBookProject:
+    title: str = "未命名任务书"
+    chapters: list[Chapter] = field(default_factory=list)
+    mod_folder: str = ""
+    format_version: int = 1
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def to_ai_data(self) -> dict:
+        return {
+            "title": self.title,
+            "chapters": [
+                {
+                    "id": chapter.id,
+                    "title": chapter.title,
+                    "icon": chapter.icon,
+                    "quests": [asdict(quest) for quest in chapter.quests],
+                }
+                for chapter in self.chapters
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict) -> "QuestBookProject":
+        chapters = []
+        for raw_chapter in value.get("chapters", []) if isinstance(value, dict) else []:
+            if not isinstance(raw_chapter, dict):
+                continue
+            quests = []
+            for raw_quest in raw_chapter.get("quests", []):
+                if not isinstance(raw_quest, dict):
+                    continue
+                tasks = [
+                    Task(
+                        type=str(task.get("type", "checkmark")),
+                        target=str(task.get("target", "") or task.get("item", "")),
+                        count=max(1, int(task.get("count", 1) or 1)),
+                    )
+                    for task in raw_quest.get("tasks", [])
+                    if isinstance(task, dict)
+                ] or [Task()]
+                quests.append(Quest(
+                    id=str(raw_quest.get("id") or new_id("quest")),
+                    title=str(raw_quest.get("title") or "新任务"),
+                    subtitle=str(raw_quest.get("subtitle") or ""),
+                    icon=str(raw_quest.get("icon") or ""),
+                    description=[str(line) for line in raw_quest.get("description", [])]
+                    if isinstance(raw_quest.get("description"), list)
+                    else [str(raw_quest.get("description", ""))],
+                    tasks=tasks,
+                    rewards=list(raw_quest.get("rewards", []))
+                    if isinstance(raw_quest.get("rewards"), list) else [],
+                    dependencies=[str(item) for item in raw_quest.get("dependencies", [])],
+                    x=float(raw_quest.get("x", 0) or 0),
+                    y=float(raw_quest.get("y", 0) or 0),
+                    shape=str(raw_quest.get("shape", "circle")),
+                ))
+            chapters.append(Chapter(
+                id=str(raw_chapter.get("id") or new_id("chapter")),
+                title=str(raw_chapter.get("title") or "新章节"),
+                icon=str(raw_chapter.get("icon") or "minecraft:book"),
+                quests=quests,
+            ))
+        return cls(
+            title=str(value.get("title") or "未命名任务书"),
+            chapters=chapters,
+            mod_folder=str(value.get("mod_folder", "")),
+            format_version=int(value.get("format_version", 1) or 1),
+        )
+
+
+class ProjectStore:
+    """Transactional project commands with undo/redo and validation."""
+
+    def __init__(self, project: QuestBookProject | None = None):
+        self.project = project or QuestBookProject()
+        self._undo: list[QuestBookProject] = []
+        self._redo: list[QuestBookProject] = []
+
+    def _checkpoint(self) -> None:
+        self._undo.append(deepcopy(self.project))
+        self._undo = self._undo[-100:]
+        self._redo.clear()
+
+    def capture_state(self):
+        """Capture project and history for an external transactional edit."""
+        return deepcopy((self.project, self._undo, self._redo))
+
+    def capture_checkpoint_state(self):
+        """Capture one lightweight Agent checkpoint without copying undo history."""
+        return deepcopy(self.project), len(self._undo), deepcopy(self._redo)
+
+    def restore_checkpoint_state(self, snapshot) -> None:
+        project, undo_length, redo = snapshot
+        self.project = deepcopy(project)
+        self._undo = self._undo[: int(undo_length)]
+        self._redo = deepcopy(redo)
+
+    def restore_state(self, snapshot) -> None:
+        self.project, self._undo, self._redo = deepcopy(snapshot)
+
+    def undo(self) -> bool:
+        if not self._undo:
+            return False
+        self._redo.append(deepcopy(self.project))
+        self.project = self._undo.pop()
+        return True
+
+    def redo(self) -> bool:
+        if not self._redo:
+            return False
+        self._undo.append(deepcopy(self.project))
+        self.project = self._redo.pop()
+        return True
+
+    def chapter(self, chapter_id: str) -> Chapter | None:
+        return next((chapter for chapter in self.project.chapters if chapter.id == chapter_id), None)
+
+    def quest(self, quest_id: str) -> tuple[Chapter, Quest] | None:
+        for chapter in self.project.chapters:
+            for quest in chapter.quests:
+                if quest.id == quest_id:
+                    return chapter, quest
+        return None
+
+    def create_chapter(self, title: str, icon: str = "minecraft:book") -> Chapter:
+        self._checkpoint()
+        chapter = Chapter(title=title.strip() or "新章节", icon=icon.strip() or "minecraft:book")
+        self.project.chapters.append(chapter)
+        return chapter
+
+    def remove_chapter(self, chapter_id: str) -> bool:
+        chapter = self.chapter(chapter_id)
+        if chapter is None:
+            return False
+        self._checkpoint()
+        removed_quests = {quest.id for quest in chapter.quests}
+        self.project.chapters = [value for value in self.project.chapters if value.id != chapter_id]
+        for current_chapter in self.project.chapters:
+            for quest in current_chapter.quests:
+                quest.dependencies = [value for value in quest.dependencies if value not in removed_quests]
+        return True
+
+    def move_chapter(self, chapter_id: str, new_index: int) -> list[Chapter]:
+        old_index = next((i for i, chapter in enumerate(self.project.chapters) if chapter.id == chapter_id), -1)
+        if old_index < 0:
+            raise ValueError(f"找不到章节：{chapter_id}")
+        target = max(0, min(int(new_index), len(self.project.chapters) - 1))
+        if target != old_index:
+            self._checkpoint()
+            chapter = self.project.chapters.pop(old_index)
+            self.project.chapters.insert(target, chapter)
+        return list(self.project.chapters)
+
+    def update_chapter(self, chapter_id: str, **changes) -> Chapter:
+        chapter = self.chapter(chapter_id)
+        if chapter is None:
+            raise ValueError(f"找不到章节：{chapter_id}")
+        self._checkpoint()
+        if "title" in changes:
+            chapter.title = str(changes["title"]).strip() or chapter.title
+        if "icon" in changes:
+            chapter.icon = str(changes["icon"]).strip() or chapter.icon
+        return chapter
+
+    def add_quest(
+        self,
+        chapter_id: str,
+        title: str,
+        description: str = "",
+        task_type: str = "checkmark",
+        target: str = "",
+        count: int = 1,
+    ) -> Quest:
+        chapter = self.chapter(chapter_id)
+        if chapter is None:
+            raise ValueError(f"找不到章节：{chapter_id}")
+        self._checkpoint()
+        index = len(chapter.quests)
+        quest = Quest(
+            title=title.strip() or "新任务",
+            description=[description.strip()] if description.strip() else [],
+            tasks=[Task(task_type.strip() or "checkmark", target.strip(), max(1, int(count)))],
+            x=float(index * 3),
+            y=0.0,
+        )
+        chapter.quests.append(quest)
+        return quest
+
+    def update_quest(self, quest_id: str, **changes) -> Quest:
+        found = self.quest(quest_id)
+        if found is None:
+            raise ValueError(f"找不到任务：{quest_id}")
+        _, quest = found
+        self._checkpoint()
+        if "title" in changes:
+            quest.title = str(changes["title"]).strip() or quest.title
+        if "subtitle" in changes:
+            quest.subtitle = str(changes["subtitle"]).strip()
+        if "icon" in changes:
+            quest.icon = str(changes["icon"]).strip()
+        if "shape" in changes:
+            quest.shape = str(changes["shape"]).strip()
+        if "description" in changes:
+            value = str(changes["description"]).strip()
+            quest.description = [value] if value else []
+        task = quest.tasks[0] if quest.tasks else Task()
+        if "task_type" in changes:
+            task.type = str(changes["task_type"]).strip() or "checkmark"
+        if "target" in changes:
+            task.target = str(changes["target"]).strip()
+        if "count" in changes:
+            task.count = max(1, int(changes["count"] or 1))
+        quest.tasks = [task]
+        return quest
+
+    def move_quest(self, quest_id: str, x: float, y: float) -> Quest:
+        found = self.quest(quest_id)
+        if found is None:
+            raise ValueError(f"找不到任务：{quest_id}")
+        self._checkpoint()
+        found[1].x = float(x)
+        found[1].y = float(y)
+        return found[1]
+
+    def move_quest_to_chapter(self, quest_id: str, chapter_id: str, x: float | None = None, y: float | None = None) -> Quest:
+        found = self.quest(quest_id)
+        target = self.chapter(chapter_id)
+        if found is None:
+            raise ValueError(f"找不到任务：{quest_id}")
+        if target is None:
+            raise ValueError(f"找不到章节：{chapter_id}")
+        source, quest = found
+        self._checkpoint()
+        if source.id != target.id:
+            source.quests = [value for value in source.quests if value.id != quest_id]
+            target.quests.append(quest)
+        if x is not None:
+            quest.x = float(x)
+        if y is not None:
+            quest.y = float(y)
+        return quest
+
+    def copy_quest(
+        self, quest_id: str, chapter_id: str, x: float, y: float, with_dependencies: bool = True,
+    ) -> Quest:
+        found = self.quest(quest_id)
+        target = self.chapter(chapter_id)
+        if found is None or target is None:
+            raise ValueError("复制来源或目标章节不存在")
+        self._checkpoint()
+        quest = deepcopy(found[1])
+        quest.id = new_id("quest")
+        quest.title = f"{quest.title} 副本"
+        quest.x = float(x)
+        quest.y = float(y)
+        if not with_dependencies:
+            quest.dependencies = []
+        target.quests.append(quest)
+        return quest
+
+    def remove_quest(self, quest_id: str) -> bool:
+        found = self.quest(quest_id)
+        if found is None:
+            return False
+        chapter, _ = found
+        self._checkpoint()
+        chapter.quests = [quest for quest in chapter.quests if quest.id != quest_id]
+        for current_chapter in self.project.chapters:
+            for current in current_chapter.quests:
+                current.dependencies = [value for value in current.dependencies if value != quest_id]
+        return True
+
+    def remove_canvas_objects(self, _chapter_id: str, references: list[tuple[str, str]]) -> int:
+        quest_ids = [object_id for kind, object_id in references if kind == "quest" and self.quest(object_id)]
+        if not quest_ids:
+            return 0
+        undo_start = len(self._undo)
+        for quest_id in quest_ids:
+            self.remove_quest(quest_id)
+        initial = self._undo[undo_start]
+        self._undo = self._undo[:undo_start] + [initial]
+        return len(quest_ids)
+
+    def connect(self, quest_id: str, dependency_id: str) -> Quest:
+        found = self.quest(quest_id)
+        dependency = self.quest(dependency_id)
+        if found is None or dependency is None:
+            raise ValueError("依赖任务不存在")
+        if dependency_id == quest_id:
+            raise ValueError("任务不能依赖自身")
+        if self._depends_on(dependency_id, quest_id):
+            raise ValueError("这条连线会形成循环依赖")
+        if dependency_id not in found[1].dependencies:
+            self._checkpoint()
+            found[1].dependencies.append(dependency_id)
+        return found[1]
+
+    def disconnect(self, quest_id: str, dependency_id: str) -> Quest:
+        found = self.quest(quest_id)
+        if found is None:
+            raise ValueError("任务不存在")
+        if dependency_id in found[1].dependencies:
+            self._checkpoint()
+            found[1].dependencies.remove(dependency_id)
+        return found[1]
+
+    def _depends_on(self, quest_id: str, dependency_id: str) -> bool:
+        visited = set()
+        pending = [quest_id]
+        while pending:
+            current_id = pending.pop()
+            if current_id == dependency_id:
+                return True
+            if current_id in visited:
+                continue
+            visited.add(current_id)
+            found = self.quest(current_id)
+            if found:
+                pending.extend(found[1].dependencies)
+        return False
+
+    def summary(self) -> dict:
+        return {
+            "title": self.project.title,
+            "chapters": [
+                {"id": chapter.id, "title": chapter.title, "quests": len(chapter.quests)}
+                for chapter in self.project.chapters
+            ],
+            "quest_count": sum(len(chapter.quests) for chapter in self.project.chapters),
+        }
+
+    def validate(self, known_items: dict | None = None) -> list[dict]:
+        known_items = known_items or {}
+        issues = []
+        if not self.project.chapters:
+            issues.append({"severity": "warning", "location": "任务书", "message": "还没有章节"})
+        all_quest_ids = {
+            quest.id for chapter in self.project.chapters for quest in chapter.quests
+        }
+        for chapter in self.project.chapters:
+            titles = set()
+            if not chapter.quests:
+                issues.append({"severity": "warning", "location": chapter.title, "message": "章节中没有任务"})
+            for quest in chapter.quests:
+                location = f"{chapter.title} / {quest.title}"
+                folded = quest.title.casefold()
+                if folded in titles:
+                    issues.append({"severity": "warning", "location": location, "message": "任务标题重复"})
+                titles.add(folded)
+                for dependency in quest.dependencies:
+                    if dependency not in all_quest_ids:
+                        issues.append({"severity": "error", "location": location, "message": f"依赖不存在：{dependency}"})
+                for task in quest.tasks:
+                    if task.type == "item" and task.target and ":" not in task.target:
+                        issues.append({"severity": "error", "location": location, "message": f"物品 ID 格式错误：{task.target}"})
+                    if task.type == "item" and ":" in task.target:
+                        namespace = task.target.split(":", 1)[0]
+                        items = known_items.get(namespace)
+                        if isinstance(items, dict) and items and task.target not in items:
+                            issues.append({"severity": "warning", "location": location, "message": f"扫描结果中未找到：{task.target}"})
+        return issues
+
+    def save(self, path: str) -> None:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(self.project.to_dict(), handle, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> "ProjectStore":
+        with open(path, "r", encoding="utf-8") as handle:
+            return cls(QuestBookProject.from_dict(json.load(handle)))
