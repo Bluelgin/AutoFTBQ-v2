@@ -12,9 +12,11 @@ public final class AgentDockState {
     }
 
     public static boolean shouldAttach(boolean canEdit) {
-        // A full FTBQ sync temporarily replaces TeamData with a loading entry.
-        // Keep an existing conversation visible; write permissions stay separate.
-        return canEdit || open;
+        // Widget construction must not depend on editor permission. FTBQ restores
+        // editorPermission asynchronously after a full client-file sync, so gating
+        // addWidgets() on canEdit can permanently hide the Agent entry for that screen.
+        // Actual writes and opening a closed dock remain permission-gated elsewhere.
+        return true;
     }
 
     public static void setOpen(boolean value) {
