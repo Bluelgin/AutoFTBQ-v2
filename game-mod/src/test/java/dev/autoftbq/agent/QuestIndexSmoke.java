@@ -37,10 +37,10 @@ public final class QuestIndexSmoke {
         if (!dev.autoftbq.agent.client.AgentDockState.shouldAttach(false))
             throw new AssertionError("Loading permissions discarded the open dock");
         dev.autoftbq.agent.client.AgentDockState.setOpen(false);
-        if (dev.autoftbq.agent.client.AgentDockState.shouldAttach(false))
-            throw new AssertionError("Non-editor opened a new dock");
+        if (!dev.autoftbq.agent.client.AgentDockState.shouldAttach(false))
+            throw new AssertionError("Transient missing permission hid the Agent entry");
         if (!dev.autoftbq.agent.client.AgentDockState.shouldAttach(true))
-            throw new AssertionError("Editor dock missing after permission recovery");
+            throw new AssertionError("Editor Agent entry missing after permission recovery");
         if (dev.autoftbq.agent.compat.ftbq.v2001.FTBQ2001ScreenSync.readyToRebind(false, true, true, 300))
             throw new AssertionError("Refreshed before team data arrived");
         if (dev.autoftbq.agent.compat.ftbq.v2001.FTBQ2001ScreenSync.readyToRebind(true, true, false, 1))
