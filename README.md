@@ -86,7 +86,6 @@ python -m unittest discover -s tests -p "test*.py"
 - `autoftbq_v2/infrastructure`：整合包扫描、AI 配置、日志和工作区恢复。
 - 根目录兼容模块：复用自 v1 的扫描、SNBT 与 AI 客户端能力，后续会逐步收进 v2 包内。
 
-## 安全说明
 
 ### 游戏内自由手绘布局（Mod alpha.15）
 
