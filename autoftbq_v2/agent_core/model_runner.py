@@ -11,22 +11,79 @@ class AgentModelRunner:
         self.client = client
         self.registry_provider = registry_provider
         self.tool_handler = tool_handler
+        self.last_truncated = False
 
-    def invoke(self, messages: list[dict], max_rounds: int) -> str:
-        registry = self.registry_provider()
+    def invoke_with_specs(self, messages, specs, *, temperature=0.35,
+                          max_tokens=4096, max_rounds=10, **options):
+        """Shared transport entry for desktop and live-game tool adapters."""
         if hasattr(self.client, "chat_with_tools"):
             response = self.client.chat_with_tools(
-                messages, registry.specs(), self.tool_handler,
-                temperature=0.35, max_tokens=4096, max_rounds=max_rounds,
+                messages, specs, self.tool_handler, temperature=temperature,
+                max_tokens=max_tokens, max_rounds=max_rounds, **options,
             )
             content = response[0] if isinstance(response, tuple) else response
+            truncated = bool(isinstance(response, tuple) and len(response) > 1 and response[1] is True)
+            envelope = self.action_envelope(content)
+            if not envelope or not envelope.get("actions"):
+                return str(content), truncated
         else:
-            content = self.run_action_protocol(messages)
-        envelope = self.action_envelope(content)
-        if envelope and envelope.get("actions"):
-            content = self.run_action_protocol(messages, content)
-        elif envelope:
-            content = str(envelope.get("reply", "") or content)
+            content = None
+        names = {spec["function"]["name"] for spec in specs}
+        conversation = [*messages, {"role": "system", "content":
+            "Return JSON {\"actions\":[{\"tool\":name,\"arguments\":{}}],\"reply\":text}. "
+            "Use only these tools: " + json.dumps(specs, ensure_ascii=False)}]
+        for _ in range(max_rounds):
+            if content is None:
+                response = self.client.chat(conversation, temperature=temperature, max_tokens=max_tokens)
+                content = response[0] if isinstance(response, tuple) else response
+            envelope = self.action_envelope(content)
+            if not envelope or not envelope.get("actions"):
+                return str(envelope.get("reply", "") if envelope else content), False
+            results = []
+            for action in envelope["actions"][:8]:
+                if not isinstance(action, dict):
+                    continue
+                name = str(action.get("tool", ""))
+                args = action.get("arguments", {})
+                try:
+                    if name not in names or not isinstance(args, dict):
+                        raise ValueError("Unknown tool or invalid arguments")
+                    result = self.tool_handler(name, args)
+                except Exception as exc:
+                    result = json.dumps({"error": str(exc)})
+                from ai_clients import _append_tool_trace
+                _append_tool_trace(options.get("trace_sink"), name, args if isinstance(args, dict) else {}, result)
+                results.append({"tool": name, "result": result})
+            conversation.extend([
+                {"role": "assistant", "content": str(content)},
+                {"role": "user", "content": json.dumps(results, ensure_ascii=False)},
+            ])
+            content = None
+        return "本批执行预算已用完，目标尚未确认完成。", True
+
+    def invoke(
+        self, messages: list[dict], max_rounds: int, tool_names=None,
+        minimum_reasoning_effort: str | None = None,
+    ) -> str:
+        registry = self.registry_provider()
+        specs = registry.specs(tool_names)
+        original_effort = getattr(self.client, "reasoning_effort", None)
+        if minimum_reasoning_effort and original_effort is not None:
+            levels = {"low": 1, "medium": 2, "high": 3}
+            if levels.get(str(original_effort), 0) < levels.get(minimum_reasoning_effort, 0):
+                self.client.reasoning_effort = minimum_reasoning_effort
+        try:
+            content, self.last_truncated = self.invoke_with_specs(
+                messages, specs, max_rounds=max_rounds,
+            )
+            envelope = self.action_envelope(content)
+            if envelope and envelope.get("actions"):
+                content = self.run_action_protocol(messages, content, tool_names)
+            elif envelope:
+                content = str(envelope.get("reply", "") or content)
+        finally:
+            if original_effort is not None:
+                self.client.reasoning_effort = original_effort
         return str(content).strip() or "操作已完成，请在左侧检查任务书。"
 
     @staticmethod
@@ -44,8 +101,8 @@ class AgentModelRunner:
                 return value
         return None
 
-    def run_action_protocol(self, messages: list[dict], first_content: str | None = None) -> str:
-        specs = self.registry_provider().function_specs()
+    def run_action_protocol(self, messages: list[dict], first_content: str | None = None, tool_names=None) -> str:
+        specs = self.registry_provider().function_specs(tool_names)
         conversation = [
             *messages,
             {

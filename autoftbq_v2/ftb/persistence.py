@@ -107,7 +107,8 @@ class FTBCompoundSynchronizer:
             raw["shape"] = quest.shape
         else:
             raw.pop("shape", None)
-        raw["dependencies"] = list(quest.dependencies)
+        if quest.dependencies or "dependencies" in raw:
+            raw["dependencies"] = list(quest.dependencies)
         old_tasks = raw.get("tasks", []) if isinstance(raw.get("tasks"), list) else []
         raw["tasks"] = [
             sync_task(
@@ -118,7 +119,8 @@ class FTBCompoundSynchronizer:
             for index, task in enumerate(quest.tasks)
         ]
         raw["rewards"] = deepcopy(quest.rewards)
-        raw["description"] = list(quest.description)
+        if quest.description or "description" in raw:
+            raw["description"] = list(quest.description)
         self.store.raw_quests[quest.id] = raw
         return raw
 

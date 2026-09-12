@@ -1,4 +1,4 @@
-"""Provider presets and model-discovery helpers for AutoFTBQ."""
+"""Provider presets and model-discovery helpers for AutoFTBQ Studio."""
 
 from __future__ import annotations
 
@@ -146,7 +146,7 @@ def fetch_provider_models(api_key, models_url, timeout=15, max_retries=2):
     headers = {
         "Authorization": f"Bearer {str(api_key).strip()}",
         "Content-Type": "application/json",
-        "User-Agent": "AutoFTBQ",
+        "User-Agent": "AutoFTBQ-Studio",
     }
     last_error = ""
     for attempt in range(max_retries + 1):

@@ -7,11 +7,16 @@ import hashlib
 import json
 import os
 import shutil
+import threading
+import time
 import zipfile
+from typing import Callable
 
 from PySide6.QtGui import QImage
 
-from ..editor.model_renderer import classify_static_model, render_static_model
+from ..editor.model_renderer import (
+    classify_static_model, render_spawn_egg_placeholder, render_static_model,
+)
 
 
 BUILTIN_REGISTRIES = {
@@ -67,6 +72,17 @@ BUILTIN_REGISTRIES = {
     },
 }
 
+SUSPICIOUS_ITEM_TOKENS = frozenset({
+    "debug", "test", "testing", "dev", "developer", "wip", "unfinished",
+    "internal", "placeholder", "dummy", "deprecated", "unused", "missingno",
+})
+UNSAFE_VANILLA_ITEMS = frozenset({
+    "minecraft:air", "minecraft:barrier", "minecraft:debug_stick",
+    "minecraft:structure_void", "minecraft:structure_block", "minecraft:jigsaw",
+    "minecraft:command_block", "minecraft:chain_command_block",
+    "minecraft:repeating_command_block", "minecraft:light",
+})
+
 
 @dataclass(frozen=True)
 class ResourceRef:
@@ -104,29 +120,321 @@ class ItemAsset:
     model_kind: str = ""
 
 
+@dataclass(frozen=True)
+class AgentItemAvailability:
+    item_id: str
+    status: str
+    allowed: bool
+    reasons: tuple[str, ...] = ()
+    evidence: tuple[str, ...] = ()
+
+
 class AssetIndex:
     """Layer Minecraft resources and lazily cache recognizable item icons."""
 
     def __init__(self, pack_root: str, cache_root: str):
         self.pack_root = os.path.abspath(pack_root)
+        self.cache_root = os.path.abspath(cache_root)
         pack_key = hashlib.sha1(os.path.normcase(self.pack_root).encode("utf-8")).hexdigest()[:12]
-        self.cache_dir = os.path.join(os.path.abspath(cache_root), pack_key)
+        self.cache_dir = os.path.join(self.cache_root, pack_key)
         self.resources: dict[str, ResourceRef] = {}
+        self._json_cache: dict[str, dict] = {}
         self.items: dict[str, ItemAsset] = {}
         self.registries: dict[str, dict[str, str]] = {}
+        self.recipe_outputs: set[str] = set()
+        self.recipe_inputs: set[str] = set()
+        self.loot_outputs: set[str] = set()
+        self.item_availability: dict[str, AgentItemAvailability] = {}
+        self._icon_locks_guard = threading.Lock()
+        self._icon_locks: dict[str, threading.Lock] = {}
+        self._build_archives: dict[str, zipfile.ZipFile] = {}
 
     @classmethod
-    def build(cls, pack_root: str, all_items: dict, cache_root: str) -> "AssetIndex":
+    def build(
+        cls, pack_root: str, all_items: dict, cache_root: str,
+        recipe_inputs: dict | None = None,
+        progress: Callable[[str], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> "AssetIndex":
         index = cls(pack_root, cache_root)
         os.makedirs(index.cache_dir, exist_ok=True)
-        index._collect_resources()
-        for namespace, values in all_items.items():
-            if not isinstance(values, dict):
-                continue
-            for item_id, name in values.items():
-                index.items[item_id] = ItemAsset(item_id=item_id, name=str(name))
-        index._build_registries()
+        report = progress or (lambda _message: None)
+        stopped = cancelled or (lambda: False)
+        started_at = time.monotonic()
+        try:
+            report("正在收集 Mod 与资源包目录…")
+            index._collect_resources(stopped)
+            index._check_cancelled(stopped)
+            report("正在整理物品模型索引…")
+            for namespace_index, (_namespace, values) in enumerate(all_items.items()):
+                if not isinstance(values, dict):
+                    continue
+                for item_id, name in values.items():
+                    index.items[item_id] = ItemAsset(item_id=item_id, name=str(name))
+                index._cooperate(stopped, namespace_index)
+            index._augment_items_from_resources(stopped)
+            report("正在整理实体、结构与战利品目录…")
+            index._build_registries(stopped)
+            recipes = recipe_inputs if isinstance(recipe_inputs, dict) else {}
+            index.recipe_outputs = {str(value) for value in recipes if ":" in str(value)}
+            index.recipe_inputs = {
+                str(item_id)
+                for values in recipes.values() if isinstance(values, list)
+                for item_id in values if ":" in str(item_id)
+            }
+            index.loot_outputs = index._collect_loot_outputs(stopped)
+            report(f"正在校验 {len(index.items)} 个 Agent 可用物品…")
+            index._build_agent_availability(stopped)
+        finally:
+            index._close_build_archives()
+        report(f"资源索引完成（{time.monotonic() - started_at:.1f} 秒）")
         return index
+
+    def cache_payload(self) -> dict:
+        """Return JSON-safe immutable scan metadata; rendered pixmaps remain lazy."""
+        return {
+            "resources": {
+                key: [value.source, value.entry] for key, value in self.resources.items()
+            },
+            "items": {
+                key: {
+                    "name": value.name,
+                    "model_path": value.model_path,
+                    "texture_path": value.texture_path,
+                    "icon_path": value.icon_path,
+                    "render_status": value.render_status,
+                    "model_kind": value.model_kind,
+                }
+                for key, value in self.items.items()
+            },
+            "registries": self.registries,
+            "recipe_outputs": sorted(self.recipe_outputs),
+            "recipe_inputs": sorted(self.recipe_inputs),
+            "loot_outputs": sorted(self.loot_outputs),
+            "item_availability": {
+                key: {
+                    "status": value.status, "allowed": value.allowed,
+                    "reasons": list(value.reasons), "evidence": list(value.evidence),
+                }
+                for key, value in self.item_availability.items()
+            },
+        }
+
+    @classmethod
+    def from_cache_payload(cls, pack_root: str, cache_root: str, payload: dict) -> "AssetIndex":
+        if not isinstance(payload, dict):
+            raise ValueError("invalid asset cache")
+        resources = payload.get("resources", {})
+        items = payload.get("items", {})
+        availability = payload.get("item_availability", {})
+        if (not isinstance(resources, dict) or len(resources) > 500_000
+                or not isinstance(items, dict) or len(items) > 250_000
+                or not isinstance(availability, dict) or len(availability) > 250_000):
+            raise ValueError("asset cache exceeds bounds")
+        index = cls(pack_root, cache_root)
+        os.makedirs(index.cache_dir, exist_ok=True)
+        for key, value in resources.items():
+            if (not isinstance(value, list) or len(value) != 2
+                    or not isinstance(value[0], str) or not isinstance(value[1], str)):
+                raise ValueError("invalid resource cache entry")
+            index.resources[str(key)] = ResourceRef(value[0], value[1])
+        item_fields = {
+            "model_path", "texture_path", "icon_path", "render_status", "model_kind",
+        }
+        for item_id, value in items.items():
+            if not isinstance(value, dict):
+                raise ValueError("invalid item cache entry")
+            details = {key: str(value.get(key, "")) for key in item_fields}
+            index.items[str(item_id)] = ItemAsset(
+                item_id=str(item_id), name=str(value.get("name", item_id)), **details,
+            )
+        registries = payload.get("registries", {})
+        if not isinstance(registries, dict) or len(registries) > 100:
+            raise ValueError("invalid registry cache")
+        index.registries = {
+            str(kind): {str(key): str(value) for key, value in values.items()}
+            for kind, values in registries.items() if isinstance(values, dict)
+        }
+        index.recipe_outputs = {str(value) for value in payload.get("recipe_outputs", [])}
+        index.recipe_inputs = {str(value) for value in payload.get("recipe_inputs", [])}
+        index.loot_outputs = {str(value) for value in payload.get("loot_outputs", [])}
+        for item_id, value in availability.items():
+            if not isinstance(value, dict):
+                raise ValueError("invalid availability cache entry")
+            index.item_availability[str(item_id)] = AgentItemAvailability(
+                str(item_id), str(value.get("status", "blocked")),
+                bool(value.get("allowed")),
+                tuple(str(item) for item in value.get("reasons", [])[:16]),
+                tuple(str(item) for item in value.get("evidence", [])[:16]),
+            )
+        return index
+
+    @staticmethod
+    def _check_cancelled(cancelled: Callable[[], bool]) -> None:
+        if cancelled():
+            raise InterruptedError("资源恢复已取消")
+
+    @classmethod
+    def _cooperate(cls, cancelled: Callable[[], bool], index: int) -> None:
+        if index % 16:
+            return
+        cls._check_cancelled(cancelled)
+        # QThread does not bypass Python's GIL. Yield regularly so the Qt event
+        # loop can paint and receive input during large pure-Python indexes.
+        time.sleep(0.001)
+
+    def _augment_items_from_resources(self, cancelled=lambda: False) -> None:
+        """Include resource-defined items even when registry scanning missed them."""
+        candidates = []
+        for index, key in enumerate(self.resources):
+            self._cooperate(cancelled, index)
+            parts = key.split("/")
+            if len(parts) < 4 or parts[0] != "assets":
+                continue
+            namespace = parts[1]
+            item_path = ""
+            if parts[2] == "items" and key.endswith(".json"):
+                item_path = "/".join(parts[3:])[:-5]
+            elif len(parts) >= 5 and parts[2:4] == ["models", "item"] and key.endswith(".json"):
+                item_path = "/".join(parts[4:])[:-5]
+            elif len(parts) >= 5 and parts[2:4] == ["textures", "item"] and key.endswith(".png"):
+                item_path = "/".join(parts[4:])[:-4]
+            if item_path:
+                candidates.append(f"{namespace}:{item_path}")
+        for item_id in candidates:
+            self.items.setdefault(item_id, ItemAsset(item_id=item_id, name=item_id))
+
+    def _collect_loot_outputs(self, cancelled=lambda: False) -> set[str]:
+        outputs: set[str] = set()
+
+        def visit(value) -> None:
+            if isinstance(value, dict):
+                entry_type = str(value.get("type", ""))
+                name = value.get("name", "")
+                if entry_type.endswith(":item") and isinstance(name, str) and ":" in name:
+                    outputs.add(name)
+                for nested in value.values():
+                    visit(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    visit(nested)
+
+        for index, key in enumerate(self.resources):
+            self._cooperate(cancelled, index)
+            if key.startswith("data/") and (
+                "/loot_table/" in key or "/loot_tables/" in key
+            ) and key.endswith(".json"):
+                visit(self._json(key))
+        return outputs
+
+    @staticmethod
+    def _suspicious_tokens(item_id: str) -> set[str]:
+        path = str(item_id).split(":", 1)[-1]
+        normalized = path.replace("-", "_").replace(".", "_").replace("/", "_")
+        return {value for value in normalized.split("_") if value in SUSPICIOUS_ITEM_TOKENS}
+
+    def _model_evidence(self, item_id: str) -> tuple[bool, list[str], list[str]]:
+        namespace, _path = item_id.split(":", 1)
+        model_path, model, resolved = self._resolve_model(item_id)
+        reasons: list[str] = []
+        evidence: list[str] = []
+        if self._resource_key(model_path) not in self.resources:
+            reasons.append("缺少物品模型")
+            return False, reasons, evidence
+        evidence.append("物品模型存在")
+        textures = model.get("textures", {}) if isinstance(model, dict) else {}
+        textures = textures if isinstance(textures, dict) else {}
+        concrete = []
+        for raw in textures.values():
+            value = str(raw or "")
+            for _depth in range(12):
+                if not value.startswith("#"):
+                    break
+                value = str(textures.get(value[1:], "") or "")
+            if value:
+                concrete.append(value)
+        missing = []
+        for value in concrete:
+            texture_namespace = value.split(":", 1)[0] if ":" in value else namespace
+            if texture_namespace == "minecraft":
+                continue
+            path = self._location(value, namespace, "textures", ".png")
+            if self._resource_key(path) not in self.resources:
+                missing.append(value)
+        if missing:
+            reasons.append(f"模型引用的贴图不存在：{missing[0]}")
+            return False, reasons, evidence
+        if not concrete and not resolved:
+            reasons.append("模型没有可验证的物品贴图")
+            return False, reasons, evidence
+        evidence.append("模型贴图完整")
+        return True, reasons, evidence
+
+    def _build_agent_availability(self, cancelled=lambda: False) -> None:
+        values: dict[str, AgentItemAvailability] = {}
+        for index, item_id in enumerate(self.items):
+            self._cooperate(cancelled, index)
+            reasons: list[str] = []
+            evidence: list[str] = []
+            suspicious = self._suspicious_tokens(item_id)
+            if item_id in UNSAFE_VANILLA_ITEMS:
+                reasons.append("属于命令、调试或技术用途物品")
+            elif suspicious:
+                reasons.append(f"ID 包含可疑开发标记：{sorted(suspicious)[0]}")
+
+            namespace = item_id.split(":", 1)[0] if ":" in item_id else ""
+            if namespace == "minecraft" and not reasons:
+                evidence.append("原版稳定物品")
+                render_safe = True
+            elif item_id.endswith("_spawn_egg"):
+                render_safe = True
+                evidence.append("标准刷怪蛋运行时模型")
+            else:
+                render_safe, model_reasons, model_evidence = self._model_evidence(item_id)
+                reasons.extend(model_reasons)
+                evidence.extend(model_evidence)
+
+            gameplay_sources = []
+            if item_id in self.recipe_outputs:
+                gameplay_sources.append("有效配方产物")
+            if item_id in self.recipe_inputs:
+                gameplay_sources.append("有效配方原料")
+            if item_id in self.loot_outputs:
+                gameplay_sources.append("战利品产物")
+            evidence.extend(gameplay_sources)
+
+            if reasons or not render_safe:
+                status, allowed = "blocked", False
+            elif namespace == "minecraft" or gameplay_sources:
+                status, allowed = "allowed", True
+            else:
+                status, allowed = "uncertain", False
+                reasons.append("未发现配方或战利品等游戏内使用证据")
+            values[item_id] = AgentItemAvailability(
+                item_id, status, allowed, tuple(dict.fromkeys(reasons)),
+                tuple(dict.fromkeys(evidence)),
+            )
+        self.item_availability = values
+
+    def agent_item_status(self, item_id: str) -> AgentItemAvailability:
+        item_id = str(item_id or "").strip()
+        known = self.item_availability.get(item_id)
+        if known is not None:
+            return known
+        return AgentItemAvailability(
+            item_id, "blocked", False, ("ID 不在已扫描的整合包物品索引中",), (),
+        )
+
+    def agent_availability_map(self) -> dict[str, dict]:
+        return {
+            item_id: {
+                "status": value.status,
+                "allowed": value.allowed,
+                "reasons": list(value.reasons),
+                "evidence": list(value.evidence),
+            }
+            for item_id, value in self.item_availability.items()
+        }
 
     @staticmethod
     def _keep_resource(key: str) -> bool:
@@ -146,16 +454,18 @@ class AssetIndex:
 
     def _add_archive(self, path: str) -> None:
         try:
-            with zipfile.ZipFile(path, "r") as archive:
-                if len(archive.infolist()) > 250_000:
-                    return
-                for info in archive.infolist():
-                    key = self._resource_key(info.filename)
-                    if info.is_dir():
-                        continue
-                    if not self._keep_resource(key):
-                        continue
-                    self.resources[key] = ResourceRef(path, info.filename)
+            archive = zipfile.ZipFile(path, "r")
+            if len(archive.infolist()) > 250_000:
+                archive.close()
+                return
+            self._build_archives[path] = archive
+            for info in archive.infolist():
+                key = self._resource_key(info.filename)
+                if info.is_dir():
+                    continue
+                if not self._keep_resource(key):
+                    continue
+                self.resources[key] = ResourceRef(path, info.filename)
         except (OSError, zipfile.BadZipFile):
             return
 
@@ -169,16 +479,18 @@ class AssetIndex:
                 if self._keep_resource(relative):
                     self.resources[relative] = ResourceRef(path)
 
-    def _collect_resources(self) -> None:
+    def _collect_resources(self, cancelled=lambda: False) -> None:
         root = self.pack_root
         mods_dir = os.path.join(root, "mods") if os.path.isdir(os.path.join(root, "mods")) else root
         # Later layers override earlier ones, matching the useful subset of resource-pack behavior.
         if os.path.isdir(root):
-            for filename in sorted(os.listdir(root)):
+            for index, filename in enumerate(sorted(os.listdir(root))):
+                self._cooperate(cancelled, index)
                 if filename.lower().endswith(".jar"):
                     self._add_archive(os.path.join(root, filename))
         if os.path.isdir(mods_dir):
-            for filename in sorted(os.listdir(mods_dir)):
+            for index, filename in enumerate(sorted(os.listdir(mods_dir))):
+                self._cooperate(cancelled, index)
                 if filename.lower().endswith((".jar", ".zip")):
                     self._add_archive(os.path.join(mods_dir, filename))
         self._add_directory(os.path.join(root, "kubejs"))
@@ -191,15 +503,38 @@ class AssetIndex:
                 elif filename.lower().endswith(".zip"):
                     self._add_archive(path)
 
+    def _close_build_archives(self) -> None:
+        for archive in self._build_archives.values():
+            try:
+                archive.close()
+            except OSError:
+                pass
+        self._build_archives.clear()
+
+    def _read_ref(self, ref: ResourceRef, max_bytes: int = 8 * 1024 * 1024) -> bytes:
+        if ref.entry:
+            archive = self._build_archives.get(ref.source)
+            if archive is not None:
+                info = archive.getinfo(ref.entry)
+                if info.file_size > max_bytes:
+                    raise ValueError(f"资源过大：{ref.entry}")
+                return archive.read(info)
+        return ref.read(max_bytes=max_bytes)
+
     def _json(self, path: str) -> dict:
-        ref = self.resources.get(self._resource_key(path))
+        key = self._resource_key(path)
+        if key in self._json_cache:
+            return self._json_cache[key]
+        ref = self.resources.get(key)
         if ref is None:
             return {}
         try:
-            value = json.loads(ref.read().decode("utf-8-sig"))
-            return value if isinstance(value, dict) else {}
+            value = json.loads(self._read_ref(ref).decode("utf-8-sig"))
+            result = value if isinstance(value, dict) else {}
         except (OSError, UnicodeError, ValueError, KeyError, zipfile.BadZipFile):
-            return {}
+            result = {}
+        self._json_cache[key] = result
+        return result
 
     @staticmethod
     def _location(value: str, default_namespace: str, category: str, extension: str) -> str:
@@ -283,6 +618,8 @@ class AssetIndex:
             texture_path = self._location(texture, namespace, "textures", ".png") if texture else ""
             if self._resource_key(texture_path) in self.resources:
                 resolved[name] = texture_path
+        if self._resource_key(direct) in self.resources:
+            resolved.setdefault("direct", direct)
         combined["textures"] = textures
         return model_path, combined, resolved
 
@@ -298,6 +635,20 @@ class AssetIndex:
                 item.render_status = "model_fallback"
 
     def icon_for(self, item_id: str) -> str:
+        with self._icon_lock(str(item_id)):
+            return self._render_icon(str(item_id))
+
+    def _icon_lock(self, item_id: str) -> threading.Lock:
+        with self._icon_locks_guard:
+            return self._icon_locks.setdefault(item_id, threading.Lock())
+
+    def cached_icon_for(self, item_id: str) -> str:
+        """Return only an already rendered icon; never decode or render on the UI thread."""
+        item = self.items.get(str(item_id))
+        path = item.icon_path if item is not None else ""
+        return path if path and os.path.isfile(path) else ""
+
+    def _render_icon(self, item_id: str) -> str:
         item = self.items.get(item_id)
         if item is None:
             return ""
@@ -313,6 +664,9 @@ class AssetIndex:
         item.model_path = model_path
         item.texture_path = next(iter(texture_paths.values()), "")
         if not item.texture_path:
+            if item.item_id.endswith("_spawn_egg"):
+                return self._generated_spawn_egg(item)
+            item.render_status = "unavailable"
             return ""
         if item.icon_path and os.path.isfile(item.icon_path):
             return item.icon_path
@@ -340,8 +694,8 @@ class AssetIndex:
                     if not rendered.save(target, "PNG"):
                         return ""
                 else:
-                    # Keep the exact original for the common single-layer path.
-                    ref = next(iter(refs.values()))
+                    # Dynamic/builtin models often ship a representative direct item texture.
+                    ref = refs.get("direct") or next(iter(refs.values()))
                     if ref.entry:
                         with open(target, "wb") as handle:
                             handle.write(ref.read())
@@ -350,9 +704,83 @@ class AssetIndex:
                     item.model_kind = kind if kind != "dynamic" else "dynamic_fallback"
             except OSError:
                 return ""
+        else:
+            try:
+                os.utime(target, None)
+            except OSError:
+                pass
         item.icon_path = target
         item.render_status = "rendered_model" if item.model_kind in {"layered", "block"} else "texture"
         return target
+
+    def _generated_spawn_egg(self, item: ItemAsset) -> str:
+        digest = hashlib.sha1(f"spawn-egg-v1|{item.item_id}".encode("utf-8")).hexdigest()[:16]
+        target = os.path.join(self.cache_dir, f"{digest}.png")
+        if not os.path.isfile(target):
+            os.makedirs(self.cache_dir, exist_ok=True)
+            image = render_spawn_egg_placeholder(item.item_id)
+            if image.isNull() or not image.save(target, "PNG"):
+                return ""
+        item.icon_path = target
+        item.model_kind = "spawn_egg_fallback"
+        item.render_status = "generated_fallback"
+        return target
+
+    def cached_image_for(self, resource_id: str) -> str:
+        raw = str(resource_id or "").strip()
+        if not raw:
+            return ""
+        namespace, path = raw.split(":", 1) if ":" in raw else ("minecraft", raw)
+        path = path.lstrip("/")
+        if path.startswith("assets/"):
+            resource_path = path
+        else:
+            path = path.removeprefix("textures/")
+            if not path.lower().endswith(".png"):
+                path += ".png"
+            resource_path = f"assets/{namespace}/textures/{path}"
+        ref = self.resources.get(self._resource_key(resource_path))
+        if ref is None:
+            return ""
+        digest = hashlib.sha1(
+            f"image|{resource_path}|{ref.source}|{ref.entry}|{ref.modified}".encode("utf-8")
+        ).hexdigest()[:16]
+        target = os.path.join(self.cache_dir, f"{digest}.png")
+        return target if os.path.isfile(target) else ""
+
+    def cleanup_cache(
+        self, max_age_seconds: int = 14 * 24 * 60 * 60, max_bytes: int = 256 * 1024 * 1024,
+    ) -> dict:
+        """Remove stale disk icons and bound the shared cache by least-recent use."""
+        root = os.path.abspath(self.cache_root)
+        if not os.path.isdir(root):
+            return {"removed": 0, "bytes_removed": 0, "remaining_bytes": 0}
+        cutoff = time.time() - max(60, int(max_age_seconds))
+        files = []
+        for current, _dirs, names in os.walk(root):
+            for name in names:
+                if not name.lower().endswith(".png"):
+                    continue
+                path = os.path.abspath(os.path.join(current, name))
+                try:
+                    stat = os.stat(path)
+                except OSError:
+                    continue
+                files.append([path, stat.st_mtime, stat.st_size])
+        removed = 0
+        bytes_removed = 0
+        remaining = sum(value[2] for value in files)
+        for path, modified, size in sorted(files, key=lambda value: value[1]):
+            if modified >= cutoff and remaining <= int(max_bytes):
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                continue
+            removed += 1
+            bytes_removed += size
+            remaining -= size
+        return {"removed": removed, "bytes_removed": bytes_removed, "remaining_bytes": remaining}
 
     def icon_status_text(self, item_id: str) -> str:
         item = self.items.get(str(item_id))
@@ -363,6 +791,7 @@ class AssetIndex:
             "layered": "多层物品贴图预览",
             "dynamic_fallback": "动态游戏模型 · 当前显示代表贴图",
             "texture": "原始物品贴图",
+            "spawn_egg_fallback": "刷怪蛋代表图标 · 游戏内颜色可能不同",
         }.get(item.model_kind, "暂无可用图标" if item.render_status == "unavailable" else "")
 
     def image_for(self, resource_id: str) -> str:
@@ -421,13 +850,14 @@ class AssetIndex:
                     result.append(shape)
         return result
 
-    def _build_registries(self) -> None:
+    def _build_registries(self, cancelled=lambda: False) -> None:
         self.registries = {
             registry: dict(values) for registry, values in BUILTIN_REGISTRIES.items()
         }
         translations = {}
         for locale in ("en_us", "zh_cn"):
-            for key in sorted(self.resources):
+            for index, key in enumerate(sorted(self.resources)):
+                self._cooperate(cancelled, index)
                 if not key.startswith("assets/") or not key.endswith(f"/lang/{locale}.json"):
                     continue
                 translations.update(self._json(key))
@@ -446,7 +876,8 @@ class AssetIndex:
             ("entity_tag", ("tags/entity_type",)),
             ("fluid_tag", ("tags/fluid",)),
         )
-        for key in self.resources:
+        for index, key in enumerate(self.resources):
+            self._cooperate(cancelled, index)
             if not key.startswith("data/") or not key.endswith(".json"):
                 continue
             parts = key.split("/", 2)
@@ -487,6 +918,9 @@ class AssetIndex:
         model_only = sum(1 for item in self.items.values() if item.render_status == "model_fallback")
         return {
             "items": len(self.items),
+            "agent_allowed": sum(1 for value in self.item_availability.values() if value.allowed),
+            "agent_blocked": sum(1 for value in self.item_availability.values() if value.status == "blocked"),
+            "agent_uncertain": sum(1 for value in self.item_availability.values() if value.status == "uncertain"),
             "icons": resolved,
             "model_fallbacks": model_only,
             "rendered_models": sum(

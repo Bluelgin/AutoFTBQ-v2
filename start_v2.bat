@@ -9,6 +9,6 @@ exit /b 0
 
 :error
 echo.
-echo AutoFTBQ v2 failed to start. Review the message above.
+echo AutoFTBQ Studio failed to start. Review the message above.
 pause
 exit /b 1

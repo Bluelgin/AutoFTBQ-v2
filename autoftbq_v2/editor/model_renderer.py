@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 from PySide6.QtCore import QPointF, QRect, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPolygonF, QTransform
 
@@ -120,3 +122,29 @@ def render_static_model(model: dict, images: dict[str, QImage], size: int = 64) 
         return _render_cube(images, size), "block"
 
     return QImage(), "texture"
+
+
+def render_spawn_egg_placeholder(item_id: str, size: int = 64) -> QImage:
+    """Create a deterministic representative icon when Minecraft supplies colors at runtime."""
+    digest = hashlib.sha1(str(item_id).encode("utf-8")).digest()
+    base = QColor(64 + digest[0] % 128, 64 + digest[1] % 128, 64 + digest[2] % 128)
+    accent = QColor(96 + digest[3] % 144, 96 + digest[4] % 144, 96 + digest[5] % 144)
+    output = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
+    output.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(output)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(base)
+    painter.drawEllipse(QRect(size // 5, size // 10, size * 3 // 5, size * 4 // 5))
+    painter.setBrush(accent)
+    spots = (
+        (digest[6] % 8 + 4, digest[7] % 9 + 3),
+        (digest[8] % 8 + 4, digest[9] % 9 + 3),
+        (digest[10] % 8 + 4, digest[11] % 9 + 3),
+        (digest[12] % 8 + 4, digest[13] % 9 + 3),
+    )
+    scale = size / 16.0
+    for x, y in spots:
+        painter.drawRect(QRect(round(x * scale), round(y * scale), max(2, round(2 * scale)), max(2, round(2 * scale))))
+    painter.end()
+    return output

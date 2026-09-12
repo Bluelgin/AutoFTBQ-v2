@@ -17,13 +17,16 @@ from .agent_core.tool_catalog import build_tool_specs
 from .agent_core.model_runner import AgentModelRunner
 from .agent_core.messages import AgentMessageBuilder
 from .agent_core.scope import AgentScopePolicy
+from .agent_core.item_policy import AgentItemPolicy
+from .agent_core.id_policy import AgentIdPolicy
 from .project import ProjectStore
 from .skill_registry import SkillRegistry
 
 
-AGENT_SYSTEM_PROMPT = """You are the AutoFTBQ project agent.
+AGENT_SYSTEM_PROMPT = """You are the AutoFTBQ Studio project agent.
 You edit the current FTB Quests project only through the provided tools.
 Inspect the project before changing it. Search real item IDs instead of guessing.
+Only use item IDs returned by search_items. Item-writing tools enforce a scanned gameplay whitelist and reject unsafe, unfinished, or unverifiable IDs.
 Read the FTB schema before editing unfamiliar task, reward, quest, chapter, or book fields.
 Relevant built-in skills are automatically injected for each request. Follow them directly; only call load_skill when no suitable skill was preloaded.
 Make small, reviewable changes and call validate_project after edits.
@@ -74,6 +77,8 @@ class ProjectAgent:
         self.model_runner = AgentModelRunner(client, lambda: self.tool_registry, self.call_tool)
         self.message_builder = AgentMessageBuilder(AGENT_SYSTEM_PROMPT)
         self.scope_policy = AgentScopePolicy(store, self.READ_ONLY_TOOLS)
+        self.item_policy = AgentItemPolicy(store, asset_index)
+        self.id_policy = AgentIdPolicy(store, asset_index, self.item_policy)
         self._run_tool_counts: dict[str, int] = {}
         self.request_context: dict = {}
 
@@ -156,6 +161,7 @@ class ProjectAgent:
         baseline = self._error_keys(self.store.validate(self.toolbox.all_items))
         self.transaction.begin(baseline, resume=resume)
         self._run_tool_counts = {}
+        self.id_policy.reset()
 
     @property
     def has_pending_changes(self) -> bool:
@@ -266,6 +272,32 @@ class ProjectAgent:
             if self.run_plan:
                 self.run_plan.record_action(name)
             return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        item_rejection = (
+            self.item_policy.rejection(name, arguments if isinstance(arguments, dict) else {})
+            if known_tool and self.tool_registry.is_write(name) else None
+        )
+        if item_rejection:
+            if self.transaction.active:
+                self.transaction.reject_tool(name, str(item_rejection["error"]))
+            self._emit("agent_tool_rejected", {"tool": name, **(arguments or {})}, item_rejection)
+            if self.run_plan:
+                self.run_plan.record_action(f"{name}:rejected")
+            return json.dumps(item_rejection, ensure_ascii=False, separators=(",", ":"))
+        id_rejection = (
+            self.id_policy.rejection(name, arguments if isinstance(arguments, dict) else {})
+            if known_tool and self.tool_registry.is_write(name) else None
+        )
+        if id_rejection:
+            if self.transaction.active:
+                self.transaction.reject_tool(name, str(id_rejection["error"]))
+            self._emit("agent_tool_rejected", {"tool": name, **(arguments or {})}, id_rejection)
+            if self.run_plan:
+                self.run_plan.record_action(f"{name}:rejected")
+            return json.dumps(id_rejection, ensure_ascii=False, separators=(",", ":"))
+        unobserved_ids = (
+            self.id_policy.unobserved(name, arguments if isinstance(arguments, dict) else {})
+            if known_tool and self.tool_registry.is_write(name) else []
+        )
         transactional_write = (
             self.transaction.active and self.tool_registry.is_write(name)
         )
@@ -288,11 +320,26 @@ class ProjectAgent:
                 self.transaction.restore_step_state(before_tool)
                 self._transaction_failure = f"{name}: {exc}"
             raise
+        try:
+            decoded_result = json.loads(encoded)
+        except (TypeError, ValueError):
+            decoded_result = None
+        if not (isinstance(decoded_result, dict) and decoded_result.get("error")):
+            self.id_policy.observe(name, arguments, decoded_result)
+            if unobserved_ids:
+                warning = {
+                    "message": "使用了真实且安全、但本轮未先查询的 ID",
+                    "ids": [
+                        {"registry": ref.registry, "id": ref.identifier}
+                        for ref in unobserved_ids
+                    ],
+                }
+                self._emit("agent_id_unverified", {"tool": name}, warning)
+                if isinstance(decoded_result, dict):
+                    decoded_result.setdefault("warnings", []).append(warning)
+                    encoded = json.dumps(decoded_result, ensure_ascii=False, separators=(",", ":"))
         if transactional_write:
-            try:
-                result = json.loads(encoded)
-            except (TypeError, ValueError):
-                result = None
+            result = decoded_result
             if isinstance(result, dict) and result.get("error"):
                 self.transaction.restore_step_state(before_tool)
                 self.transaction.reject_tool(name, str(result["error"]))
@@ -317,8 +364,64 @@ class ProjectAgent:
             self.run_plan.record_action(name)
         return encoded
 
-    def _invoke_model(self, messages: list[dict], max_rounds: int) -> str:
-        return self.model_runner.invoke(messages, max_rounds)
+    def _model_tool_names(self, request: str) -> set[str]:
+        """Keep each model round focused without changing the executable tool policy."""
+        intent = str(self.request_context.get("intent") or "auto")
+        common = {
+            "get_project_summary", "get_chapter_quests", "get_ftb_schema", "load_skill",
+            "get_quest_data", "get_chapter_data", "get_quest_sections",
+            "search_items", "search_registry", "get_recipe", "validate_project",
+        }
+        groups = {
+            "inspect": set(),
+            "explain": set(),
+            "layout": {"move_quest", "move_quest_to_chapter"},
+            "connect": {"connect_quests", "disconnect_quests", "apply_dependency_plan"},
+            "polish": {"update_quest_fields", "update_chapter_fields", "update_translation"},
+            "improve": {
+                "update_quest", "update_quest_fields", "update_chapter_fields",
+                "add_quest_object", "add_task_condition", "update_quest_object",
+                "remove_quest_object", "move_quest_object", "replace_quest_sections",
+                "connect_quests", "disconnect_quests", "apply_dependency_plan",
+            },
+            "complete": {
+                "add_quest", "add_quest_chain", "update_quest", "update_quest_fields",
+                "add_quest_object", "add_task_condition", "update_quest_object",
+                "connect_quests", "apply_dependency_plan", "move_quest",
+            },
+        }
+        creation = {
+            "create_chapter", "add_quest", "add_quest_chain", "update_quest",
+            "update_quest_fields", "update_chapter_fields", "add_quest_object",
+            "add_task_condition", "update_quest_object", "replace_quest_sections",
+            "connect_quests", "apply_dependency_plan", "move_quest",
+        }
+        names = common | groups.get(intent, creation)
+        if intent == "generate":
+            names |= creation
+        text = str(request or "")
+        if any(word in text for word in ("删除", "移除")):
+            names |= {"remove_quest", "remove_chapter", "remove_quest_object"}
+        if any(word in text for word in ("复制", "跨章节", "移动到章节")):
+            names |= {"copy_quest", "move_quest_to_chapter"}
+        if any(word in text for word in ("章节图片", "任务跳转", "章节链接")):
+            names |= {"add_chapter_object", "update_chapter_object", "remove_chapter_object", "copy_chapter_object"}
+        if any(word in text for word in ("奖励表", "章节组", "全局配置", "翻译", "多语言", "data.snbt")):
+            names |= {
+                "get_book_document", "update_book_document", "list_translations", "update_translation",
+                "create_reward_table", "create_chapter_group", "remove_chapter_group",
+                "remove_reward_table", "get_document_objects", "add_document_object",
+                "update_document_object", "remove_document_object", "move_document_object",
+            }
+        return names
+
+    def _invoke_model(
+        self, messages: list[dict], max_rounds: int, tool_names=None,
+        minimum_reasoning_effort: str | None = None,
+    ) -> str:
+        return self.model_runner.invoke(
+            messages, max_rounds, tool_names, minimum_reasoning_effort,
+        )
 
     def run(self, user_message: str) -> str:
         if self.client is None:
@@ -345,8 +448,9 @@ class ProjectAgent:
             plan_instructions=plan.instructions(),
             request=effective_request,
         )
+        model_tool_names = self._model_tool_names(effective_request)
         try:
-            content = self._invoke_model(messages, 18)
+            content = self._invoke_model(messages, 18, model_tool_names)
             if self._transaction_failure:
                 failure = self._transaction_failure
                 plan.phase = "failed"
@@ -367,11 +471,15 @@ class ProjectAgent:
             })
             if failures:
                 plan.phase = "repairing"
-                self._emit("agent_repair", {"failures": failures}, {"status": "started"})
+                self._emit("agent_repair", {"failures": failures}, {
+                    "status": "started", "strategy": "expanded_tools_medium_reasoning",
+                })
                 repair_messages = self.message_builder.build_repair(
                     messages, content, failures,
                 )
-                content = self._invoke_model(repair_messages, 10)
+                content = self._invoke_model(
+                    repair_messages, 10, None, minimum_reasoning_effort="medium",
+                )
                 if self._transaction_failure:
                     failure = self._transaction_failure
                     plan.phase = "failed"

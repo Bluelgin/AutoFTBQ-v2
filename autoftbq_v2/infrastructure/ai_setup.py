@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
     QComboBox,
+    QCheckBox,
     QDialog,
     QFormLayout,
     QHBoxLayout,
@@ -63,14 +64,21 @@ def client_from_config(config: dict):
         raise ValueError(error)
     engine = str(config.get("engine") or "generic")
     provider = normalize_provider(config.get("provider"))
-    return create_chat_client(
+    api_url = str(config.get("api_url") or "")
+    reasoning_effort = str(config.get("reasoning_effort") or "").strip().casefold()
+    if reasoning_effort not in {"auto", "low", "medium", "high"}:
+        reasoning_effort = "low" if "openrouter.ai" in api_url.casefold() else "auto"
+    client = create_chat_client(
         "ollama" if engine == "ollama" else "generic",
         api_key=config.get("api_key", ""),
         ollama_model=config.get("ollama_model"),
         provider=provider,
         api_url=config.get("api_url") if provider == CUSTOM_PROVIDER else None,
         api_model=config.get("api_model"),
+        reasoning_effort=reasoning_effort,
     )
+    client.supports_images = config.get("image_input_enabled") is True
+    return client
 
 
 def save_config(path: str, ai_config: dict) -> None:
@@ -178,12 +186,20 @@ class AISetupDialog(QDialog):
         self.model.setPlaceholderText("模型 ID")
         self.ollama_model = QLineEdit()
         self.ollama_model.setPlaceholderText("例如：qwen3:8b")
+        self.reasoning_effort = QComboBox()
+        self.reasoning_effort.addItem("自动（由模型决定）", "auto")
+        self.reasoning_effort.addItem("低（推荐，更快）", "low")
+        self.reasoning_effort.addItem("中", "medium")
+        self.reasoning_effort.addItem("高", "high")
         form.addRow("接入方式", self.engine)
         form.addRow("服务商", self.provider)
         form.addRow("API Key", self.api_key)
         form.addRow("API 地址", self.api_url)
         form.addRow("模型 ID", self.model)
         form.addRow("Ollama 模型", self.ollama_model)
+        form.addRow("推理强度", self.reasoning_effort)
+        self.image_input = QCheckBox("该模型支持图片输入（多模态）；启用画板生成")
+        form.addRow("图片能力", self.image_input)
         layout.addLayout(form)
 
         self.state = QLabel("修改配置后请测试连接")
@@ -210,6 +226,8 @@ class AISetupDialog(QDialog):
         self.provider.currentIndexChanged.connect(self._provider_changed)
         for widget in (self.api_key, self.api_url, self.model, self.ollama_model):
             widget.textChanged.connect(self._invalidate_test)
+        self.reasoning_effort.currentIndexChanged.connect(self._invalidate_test)
+        self.image_input.toggled.connect(self._invalidate_test)
         self._engine_changed()
         self.api_url.setEnabled(
             self.provider.currentData() == CUSTOM_PROVIDER and self.engine.currentData() != "ollama"
@@ -217,6 +235,7 @@ class AISetupDialog(QDialog):
 
     def _load_existing(self) -> None:
         config = load_config(self.config_path)
+        self.image_input.setChecked(config.get("image_input_enabled") is True)
         engine = "ollama" if config.get("engine") == "ollama" else "generic"
         self.engine.setCurrentIndex(max(0, self.engine.findData(engine)))
         provider = normalize_provider(config.get("provider"))
@@ -225,6 +244,10 @@ class AISetupDialog(QDialog):
         self.api_url.setText(str(config.get("api_url") or ""))
         self.model.setText(resolve_provider_model(provider, config.get("api_model")))
         self.ollama_model.setText(str(config.get("ollama_model") or "qwen2.5-coder:7b"))
+        saved_effort = str(config.get("reasoning_effort") or "").strip().casefold()
+        if saved_effort not in {"auto", "low", "medium", "high"}:
+            saved_effort = "low" if "openrouter.ai" in str(config.get("api_url") or "").casefold() else "auto"
+        self.reasoning_effort.setCurrentIndex(max(0, self.reasoning_effort.findData(saved_effort)))
 
     def _signature(self) -> str:
         safe = dict(self.values())
@@ -238,6 +261,8 @@ class AISetupDialog(QDialog):
             "api_url": self.api_url.text().strip(),
             "api_model": self.model.text().strip(),
             "ollama_model": self.ollama_model.text().strip(),
+            "reasoning_effort": str(self.reasoning_effort.currentData()),
+            "image_input_enabled": self.image_input.isChecked(),
         }
 
     def _invalidate_test(self, *_args) -> None:
@@ -247,7 +272,7 @@ class AISetupDialog(QDialog):
 
     def _engine_changed(self, *_args) -> None:
         local = self.engine.currentData() == "ollama"
-        for widget in (self.provider, self.api_key, self.api_url, self.model):
+        for widget in (self.provider, self.api_key, self.api_url, self.model, self.reasoning_effort):
             widget.setEnabled(not local)
         self.ollama_model.setEnabled(local)
         self._invalidate_test()

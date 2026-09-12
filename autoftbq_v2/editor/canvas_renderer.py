@@ -39,6 +39,7 @@ class QuestCanvasRenderer:
         selected_quest_id: str = "",
         agent_quest_ids=(),
         asset_index=None,
+        icon_loader=None,
         agent_busy: bool = False,
         on_quest_move=None,
         on_image_move=None,
@@ -57,8 +58,8 @@ class QuestCanvasRenderer:
             if not isinstance(raw, dict):
                 continue
             image_path = (
-                asset_index.image_for(str(raw.get("image") or ""))
-                if asset_index and hasattr(asset_index, "image_for") else ""
+                asset_index.cached_image_for(str(raw.get("image") or ""))
+                if asset_index and hasattr(asset_index, "cached_image_for") else ""
             )
             scene.addItem(self.image_node_factory(raw, image_path, on_image_move))
 
@@ -66,10 +67,22 @@ class QuestCanvasRenderer:
         for quest in chapter.quests:
             task = quest.tasks[0] if quest.tasks else None
             icon_id = quest.icon or (task.target if task else "")
-            icon_path = asset_index.icon_for(icon_id) if asset_index else ""
+            icon_path = (
+                asset_index.cached_icon_for(icon_id)
+                if asset_index and hasattr(asset_index, "cached_icon_for") else ""
+            )
+            asset = getattr(asset_index, "items", {}).get(icon_id) if asset_index else None
+            pending = bool(asset and getattr(asset, "render_status", "missing") != "unavailable")
+            status_reader = getattr(asset_index, "icon_status_text", None) if asset_index else None
+            icon_status = str(status_reader(icon_id) or "") if callable(status_reader) else ""
+            if icon_id and not icon_path and not icon_status:
+                icon_status = "后台准备中" if pending else "没有找到可用模型或代表贴图"
             node = self.quest_node_factory(
                 quest, quest.x * 72, quest.y * 72, icon_path, on_quest_move,
                 agent_context=quest.id in scoped_quests,
+                icon_id=icon_id, icon_loader=icon_loader,
+                icon_placeholder="…" if pending and not icon_path else ("?" if icon_id and not icon_path else ""),
+                icon_status=icon_status,
             )
             node.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsMovable, not agent_busy)
             scene.addItem(node)
@@ -113,7 +126,6 @@ class QuestCanvasRenderer:
             scene.blockSignals(True)
             selected_node.setSelected(True)
             scene.blockSignals(False)
-        scene.setSceneRect(scene.itemsBoundingRect().adjusted(-40, -40, 80, 80))
         return CanvasRenderResult(chapter.title, nodes)
 
     def _dependency_line(self, source, target, controls):

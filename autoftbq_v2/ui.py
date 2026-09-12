@@ -1,11 +1,14 @@
-"""PySide6 workspace for the AutoFTBQ v2 direction prototype."""
+"""PySide6 workspace for AutoFTBQ Studio."""
 
 from __future__ import annotations
 
 from html import escape
+from copy import deepcopy
 import json
 import logging
 import os
+import secrets
+import time
 
 from PySide6.QtCore import QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QPixmap, QShortcut, QTextCursor
@@ -45,7 +48,10 @@ from snbt_parser import to_snbt
 from .editor.agent_panel import AgentPanel
 from .agent_core.runtime import AgentReview, AgentRuntimeState, interrupted_run_message
 from .agent_core.session import AgentSessionService
+from .bridge import StudioBridgeServer
+from .bridge.live_agent import LiveProjectAgentTask
 from .editor.canvas_renderer import QuestCanvasRenderer
+from .editor.icon_cache import IconPixmapCache
 from .editor.canvas_items import (
     AgentContextChapterList, ChapterImageNode, CurvedDependencyLine, DependencyLine,
     FormWheelNavigationFilter, QuestCanvas, QuestLinkNode, QuestNode, apply_light_palette,
@@ -56,6 +62,7 @@ from .agent_core.requests import (
     parse_request,
     prepare_request,
 )
+from .agent_core.item_policy import AgentItemPolicy
 from .infrastructure.ai_setup import AISetupDialog, client_from_config, load_config, validate_ai_config
 from .infrastructure.app_logging import LOGGER_NAME, configure_logging, install_exception_hooks
 from .infrastructure.asset_index import AssetIndex
@@ -66,7 +73,7 @@ from .editor.commands import EditorProjectCommands
 from .editor.quest_inspector import condition_summary, inspector_data, parse_sections
 from .infrastructure.project_files import ProjectFileService
 from .editor.quest_connections import QuestConnectionController
-from .editor.picker_dialogs import ItemPickerDialog, RegistryPickerDialog
+from .editor.picker_dialogs import IconPickerDialog, ItemPickerDialog, RegistryPickerDialog
 from .editor.schema_editor import (
     ChapterCanvasObjectsEditor,
     ChapterGroupsEditor,
@@ -77,7 +84,9 @@ from .editor.schema_editor import (
 )
 from .infrastructure.workspace_session import WorkspaceSessionRepository
 from .infrastructure.workspace_state import WorkspaceState
-from .infrastructure.workers import AgentWorker, ModpackScanWorker
+from .infrastructure.workers import (
+    AgentWorker, CacheCleanupWorker, IconPrewarmWorker, ModpackScanWorker,
+)
 
 # Keep historical imports working while worker implementations live in the
 # infrastructure module.
@@ -89,7 +98,7 @@ RESOURCE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROOT_DIR = application_dir(RESOURCE_DIR)
 LOGGER = logging.getLogger(LOGGER_NAME)
 LOG_PATH = os.path.join(ROOT_DIR, "logs", "autoftbq_v2.log")
-PROJECT_FILTER = "AutoFTBQ Project (*.autoftbq.json);;JSON (*.json)"
+PROJECT_FILTER = "AutoFTBQ Studio Project (*.autoftbq.json);;JSON (*.json)"
 QUEST_SHAPES = (
     ("默认", ""),
     ("圆形", "circle"),
@@ -142,8 +151,11 @@ class MainWindow(QMainWindow):
         self.agent = None
         self.agent_thread = None
         self.scan_thread = None
+        self.icon_prewarm_thread = None
+        self.cache_cleanup_thread = None
         self._automatic_scan = False
         self._scan_preserve_store = False
+        self._scan_last_progress_at = 0.0
         self.current_chapter_id = ""
         self.current_quest_id = ""
         self.connect_mode = False
@@ -152,8 +164,18 @@ class MainWindow(QMainWindow):
         self.agent_write_shortcuts = []
         self._agent_control_states = {}
         self._agent_shortcut_states = {}
+        self._agent_attention_message = ""
+        self.game_agent_task = None
+        self._game_event_cursor = 0
+        self._live_game_base_payload = None
+        self._live_game_revision = ""
+        self._live_game_pending_payload = None
+        self._applying_shared_events = False
+        self._shared_studio_request_ids: list[str] = []
         self.canvas_clipboard = None
+        self._canvas_bounds_chapter_id = None
         self._loading_inspector = False
+        self.icon_pixmap_cache = IconPixmapCache(max_entries=256, ttl_seconds=600)
         self.canvas_renderer = QuestCanvasRenderer(
             QuestNode, ChapterImageNode, QuestLinkNode, DependencyLine, CurvedDependencyLine,
         )
@@ -161,7 +183,7 @@ class MainWindow(QMainWindow):
         self.ai_configured = False
         if self._workspace_enabled:
             self._load_workspace_snapshot()
-        self.setWindowTitle("AutoFTBQ v2 - Agent Workspace")
+        self.setWindowTitle("AutoFTBQ Studio")
         self.resize(1460, 900)
         self.setMinimumSize(1100, 700)
         self._build_ui()
@@ -170,6 +192,14 @@ class MainWindow(QMainWindow):
         self.workspace_autosave.setSingleShot(True)
         self.workspace_autosave.setInterval(900)
         self.workspace_autosave.timeout.connect(self._save_workspace_snapshot)
+        self.icon_memory_cleanup = QTimer(self)
+        self.icon_memory_cleanup.setInterval(60_000)
+        self.icon_memory_cleanup.timeout.connect(self.icon_pixmap_cache.cleanup)
+        self.icon_memory_cleanup.start()
+        self.icon_disk_cleanup = QTimer(self)
+        self.icon_disk_cleanup.setInterval(30 * 60_000)
+        self.icon_disk_cleanup.timeout.connect(self._start_cache_cleanup)
+        self.icon_disk_cleanup.start()
         self.prompt.textChanged.connect(self.schedule_workspace_save)
         self.canvas.view_changed.connect(self.schedule_workspace_save)
         self.refresh_all()
@@ -241,20 +271,77 @@ class MainWindow(QMainWindow):
         return FTBQuestStore.create_new()
 
     def _build_ui(self):
+        self._game_backend_mode = False
+        self._backend_event_cursor = 0
+        self._backend_conversation = ""
         root = QWidget()
         root_layout = QHBoxLayout(root)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
         root_layout.addWidget(self._build_sidebar())
         root_layout.addWidget(self._build_main_area(), 1)
-        self.setCentralWidget(root)
+        self.desktop_workspace = root
+        self.workspace_modes = QStackedWidget()
+        self.workspace_modes.addWidget(root)
+        backend = QWidget()
+        layout = QVBoxLayout(backend)
+        layout.setContentsMargins(32, 28, 32, 28)
+        title = QLabel("AutoFTBQ Studio · 游戏后端模式")
+        title.setStyleSheet("font-size: 24px; font-weight: bold")
+        layout.addWidget(title)
+        hint = QLabel("请在游戏内 FTB Quests 窗口编辑任务书或向 Agent 提出要求。\n"
+                      "修改由游戏服务器保存并实时刷新，可在游戏内撤销。离线工作台草稿已保留。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.backend_status = QLabel("等待游戏连接")
+        self.backend_status.setWordWrap(True)
+        layout.addWidget(self.backend_status)
+        configure = QPushButton("模型配置")
+        configure.clicked.connect(lambda: self.open_ai_setup())
+        layout.addWidget(configure)
+        self.backend_history = QTextBrowser()
+        layout.addWidget(self.backend_history, 1)
+        self.workspace_modes.addWidget(backend)
+        self.setCentralWidget(self.workspace_modes)
+
+    def _enter_game_backend_mode(self):
+        if self._game_backend_mode:
+            return
+        self._save_workspace_snapshot()
+        self._game_backend_mode = True
+        self.desktop_workspace.setEnabled(False)
+        self.workspace_modes.setCurrentIndex(1)
+        self.setWindowTitle("AutoFTBQ Studio · 游戏后端模式")
+
+    def _refresh_backend_history(self, service, value):
+        conversation = str(value.get("conversation_id", ""))
+        if conversation != self._backend_conversation:
+            self._backend_conversation = conversation
+            self._backend_event_cursor = 0
+            self.backend_history.clear()
+        session_id = value.get("session_id")
+        if not session_id or not conversation:
+            return
+        for event in service.events(session_id, self._backend_event_cursor, 200):
+            self._backend_event_cursor = max(self._backend_event_cursor, int(event["event_id"]))
+            kind = str(event.get("kind", ""))
+            payload = event.get("payload", {})
+            if kind.startswith("chat."):
+                label = "玩家" if kind == "chat.user" else "Agent"
+                text = str(payload.get("text", ""))
+            elif kind.startswith(("work.", "change.")):
+                label = "工作记录"
+                text = str(payload.get("message") or payload.get("summary") or payload.get("stage") or kind)
+            else:
+                continue
+            self.backend_history.append(f"<b>{label}</b>：{escape(text)}")
 
     def _build_sidebar(self):
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(230)
+        sidebar.setFixedWidth(248)
         layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(20, 22, 20, 18)
+        layout.setContentsMargins(18, 22, 18, 18)
         layout.setSpacing(12)
 
         brand_row = QHBoxLayout()
@@ -263,7 +350,7 @@ class MainWindow(QMainWindow):
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
         logo.setFixedSize(42, 42)
         brand = QVBoxLayout()
-        name = QLabel("AutoFTBQ")
+        name = QLabel("AutoFTBQ\nStudio")
         name.setObjectName("brandName")
         branch = QLabel("v2 Agent Workspace")
         branch.setObjectName("sidebarMuted")
@@ -540,6 +627,8 @@ class MainWindow(QMainWindow):
         self.quest_title = QLineEdit()
         self.quest_subtitle = QLineEdit()
         self.quest_icon = QLineEdit()
+        self.quest_icon.setPlaceholderText("留空时跟随首个完成条件")
+        self.quest_icon.textChanged.connect(self.update_quest_icon_preview)
         self.quest_chapter = QComboBox()
         self.quest_chapter.activated.connect(self.move_selected_quest_to_chapter)
         self.quest_type = QComboBox()
@@ -558,7 +647,30 @@ class MainWindow(QMainWindow):
         self.quest_shape.setToolTip("基础形状来自 FTB Quests 本体；主题扩展形状会作为自定义值保留")
         form.addRow("标题", self.quest_title)
         form.addRow("副标题", self.quest_subtitle)
-        form.addRow("任务图标", self.quest_icon)
+        icon_row = QWidget()
+        icon_layout = QHBoxLayout(icon_row)
+        icon_layout.setContentsMargins(0, 0, 0, 0)
+        self.quest_icon_preview = QLabel("无图标")
+        self.quest_icon_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.quest_icon_preview.setFixedSize(38, 38)
+        self.quest_icon_preview.setObjectName("questIconPreview")
+        choose_icon = QPushButton("选择…")
+        choose_icon.clicked.connect(self.choose_quest_icon)
+        use_target_icon = QToolButton()
+        use_target_icon.setText("使用条件物品")
+        use_target_icon.setToolTip("把首个完成条件的目标物品设为任务图标")
+        use_target_icon.clicked.connect(self.use_target_as_quest_icon)
+        clear_icon = QToolButton()
+        clear_icon.setText("清除")
+        clear_icon.setToolTip("清除自定义图标，让 FTB Quests 使用默认显示")
+        clear_icon.clicked.connect(self.clear_quest_icon)
+        icon_layout.addWidget(self.quest_icon_preview)
+        icon_layout.addWidget(self.quest_icon, 1)
+        icon_layout.addWidget(choose_icon)
+        icon_layout.addWidget(use_target_icon)
+        icon_layout.addWidget(clear_icon)
+        form.addRow("任务图标", icon_row)
+        self.quest_target.textChanged.connect(self.update_quest_icon_preview)
         form.addRow("所属章节", self.quest_chapter)
         form.addRow("节点形状", self.quest_shape)
         self.target_icon_preview = QLabel("无图标")
@@ -642,6 +754,8 @@ class MainWindow(QMainWindow):
         panel.setup_requested.connect(self.open_ai_setup)
         panel.clear_context_requested.connect(self.clear_agent_context)
         panel.command_selected.connect(self.select_agent_command)
+        panel.open_game_book_requested.connect(self.open_live_game_book)
+        panel.sync_game_book_requested.connect(self.sync_live_game_book)
         panel.undo_checkpoint_button.clicked.connect(self.undo_agent_checkpoint)
 
         # Temporary compatibility aliases keep existing controllers and tests stable
@@ -649,6 +763,8 @@ class MainWindow(QMainWindow):
         self.agent_panel = panel
         for name in (
             "agent_state", "ai_setup_button", "model_label", "chat", "agent_goal_label",
+            "game_bridge_label",
+            "open_game_book_button", "sync_game_book_button",
             "agent_progress_bar", "agent_current_label", "agent_progress_list",
             "undo_checkpoint_button", "action_toggle_button", "action_list",
             "agent_context_label", "clear_agent_context_button", "prompt", "send_shortcut",
@@ -670,7 +786,7 @@ class MainWindow(QMainWindow):
             QMainWindow, #mainArea { background: #f3f1eb; color: #202520; }
             #sidebar { background: #1d2824; color: #edf2ef; border: none; }
             #logo { background: #d7f05c; color: #1e2925; border-radius: 13px; font-size: 16px; font-weight: 800; }
-            #brandName { color: white; font-size: 18px; font-weight: 800; }
+            #brandName { color: white; font-size: 17px; font-weight: 800; }
             #sidebarMuted { color: #899b93; font-size: 10px; }
             #sidebarLabel { color: #a9b7b0; font-size: 11px; font-weight: 700; margin-top: 8px; }
             #sidebarHint { background: #263630; color: #c8d5cf; border: 1px solid #3b4b45; border-radius: 10px; padding: 14px; }
@@ -761,7 +877,7 @@ class MainWindow(QMainWindow):
             #validationPanel QListWidget::item { color: #303a34; border-bottom: 1px solid #e4dfd5; }
             #inspectorPanel QLineEdit, #inspectorPanel QComboBox, #inspectorPanel QTextEdit, #inspectorPanel QSpinBox,
             #rawPanel QTextEdit { background: #fffefb; color: #202722; border: 1px solid #cfc9bd; }
-            #targetIconPreview, #itemPreview { background: #eeeae1; color: #6c746e; border: 1px solid #cbc5b9; border-radius: 7px; font-size: 9px; }
+            #targetIconPreview, #questIconPreview, #itemPreview { background: #eeeae1; color: #6c746e; border: 1px solid #cbc5b9; border-radius: 7px; font-size: 9px; }
             #pickerHint { color: #59645d; }
             #pickerDialog { background: #f3f1eb; color: #202722; }
             #pickerDialog #pickerSearch, #pickerDialog #pickerResults {
@@ -770,6 +886,9 @@ class MainWindow(QMainWindow):
             }
             #pickerDialog #pickerResults::item { color: #202722; }
             #pickerDialog #pickerResults::item:selected { background: #d4e8df; color: #164f40; }
+            #pickerDialog #iconPickerResults { background: #fbfaf6; border: 1px solid #d7d2c7; border-radius: 8px; }
+            #pickerDialog #iconPickerResults::item { color: #202722; padding: 5px; border-radius: 7px; }
+            #pickerDialog #iconPickerResults::item:selected { background: #d4e8df; color: #164f40; }
             #autosaveState { color: #27705a; font-size: 11px; font-weight: 600; }
             #conditionSummary { color: #3d4942; background: #eef2ed; border: 1px solid #d5ddd7; border-radius: 7px; padding: 7px; }
             #fieldHelp { color: #526159; background: #edf3ef; border: 1px solid #d5e1da; border-radius: 6px; padding: 7px; }
@@ -935,12 +1054,19 @@ class MainWindow(QMainWindow):
             selected_quest_id=self.current_quest_id,
             agent_quest_ids=self.agent_context_quest_ids,
             asset_index=self.asset_index,
+            icon_loader=self.icon_pixmap_cache.get,
             agent_busy=self.agent_busy,
             on_quest_move=self._node_moved,
             on_image_move=self._chapter_image_moved,
             on_link_move=self._quest_link_moved,
             on_link_open=self.open_linked_quest,
         )
+        bounds_chapter_id = self.current_chapter_id if result.chapter_title else ""
+        same_chapter = bounds_chapter_id == self._canvas_bounds_chapter_id
+        self.canvas.reset_scene_bounds(
+            self.scene.itemsBoundingRect(), preserve=same_chapter,
+        )
+        self._canvas_bounds_chapter_id = bounds_chapter_id
         if not result.chapter_title:
             self.chapter_heading.setText("选择一个章节")
             self.schedule_workspace_save()
@@ -992,7 +1118,9 @@ class MainWindow(QMainWindow):
 
     def fit_canvas(self):
         if self.scene.items():
-            self.canvas.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            content = self.scene.itemsBoundingRect().adjusted(-40, -40, 40, 40)
+            self.canvas.fitInView(content, Qt.AspectRatioMode.KeepAspectRatio)
+            self.canvas.ensure_scene_space()
             self.canvas.view_changed.emit()
 
     def select_chapter(self, current, _previous):
@@ -1148,6 +1276,35 @@ class MainWindow(QMainWindow):
             self.quest_target.setText(picker.selected_id)
             self.schedule_quest_autosave()
 
+    def choose_quest_icon(self) -> None:
+        if self.asset_index is None or not self.asset_index.items:
+            QMessageBox.information(self, "选择任务图标", "请先选择并扫描整合包。")
+            return
+        picker = IconPickerDialog(
+            self.asset_index,
+            self.quest_icon.text().strip(),
+            self,
+            icon_loader=self.icon_pixmap_cache.get,
+        )
+        if picker.exec() == QDialog.DialogCode.Accepted:
+            self.quest_icon.setText(picker.selected_id)
+            self.schedule_quest_autosave()
+
+    def use_target_as_quest_icon(self) -> None:
+        item_id = self.quest_target.text().strip()
+        if not item_id:
+            QMessageBox.information(self, "使用条件物品", "当前首个完成条件没有可用的目标物品 ID。")
+            return
+        if self.quest_type.currentData() != "item":
+            QMessageBox.information(self, "使用条件物品", "当前首个完成条件不是物品条件，请改用“选择…”挑选图标。")
+            return
+        self.quest_icon.setText(item_id)
+        self.schedule_quest_autosave()
+
+    def clear_quest_icon(self) -> None:
+        self.quest_icon.clear()
+        self.schedule_quest_autosave()
+
     def pick_registry_value(self, registry: str, current: str = "") -> str:
         if registry == "item":
             if self.asset_index is None or not self.asset_index.items:
@@ -1260,6 +1417,25 @@ class MainWindow(QMainWindow):
         status = status_reader(item_id) if callable(status_reader) else ""
         detail = f"{asset.name}\n{item_id}" if asset else item_id
         self.target_icon_preview.setToolTip(detail + (f"\n{status}" if status else ""))
+
+    def update_quest_icon_preview(self, *_args) -> None:
+        item_id = self.quest_icon.text().strip()
+        effective_id = item_id or self.quest_target.text().strip()
+        path = (
+            self.asset_index.cached_icon_for(effective_id)
+            if self.asset_index and effective_id else ""
+        )
+        pixmap = self.icon_pixmap_cache.get(path, 30) if path else QPixmap()
+        if pixmap.isNull():
+            self.quest_icon_preview.setPixmap(QPixmap())
+            self.quest_icon_preview.setText("自动" if not item_id else "…")
+        else:
+            self.quest_icon_preview.setText("")
+            self.quest_icon_preview.setPixmap(pixmap)
+        source = "跟随完成条件" if not item_id else "自定义任务图标"
+        self.quest_icon_preview.setToolTip(
+            f"{source}\n{effective_id}" if effective_id else "未设置任务图标"
+        )
 
     def save_project_title(self):
         self.store.project.title = self.project_title.text().strip() or "未命名任务书"
@@ -1467,10 +1643,16 @@ class MainWindow(QMainWindow):
         for value in self.chat_records:
             self._render_chat(value["role"], value["text"])
         saved_actions = list(self.action_records)
-        self.action_records.clear()
         self.action_list.clear()
         for value in saved_actions:
-            self.append_action(value["name"], value["detail"], refresh=False)
+            self._render_action(value["name"], value["detail"])
+        # Restored actions are history, not live Agent events.  The progress bar
+        # must describe only a request that is running in this process.
+        self.agent_panel.set_progress_idle()
+        restored_phase = str(self._restored_agent_run_state.get("phase", ""))
+        if restored_phase in {"needs_attention", "interrupted", "failed"}:
+            self._agent_attention_message = "当前：上一轮尚未完成，可发送“继续”恢复执行"
+            self.agent_current_label.setText(self._agent_attention_message)
         self.prompt.setPlainText(getattr(self, "_restored_prompt", ""))
         QTimer.singleShot(0, self._restore_workspace_view)
 
@@ -1479,8 +1661,15 @@ class MainWindow(QMainWindow):
         current = self.canvas.transform().m11() or 1.0
         zoom = max(0.15, min(zoom, 4.0))
         self.canvas.scale(zoom / current, zoom / current)
-        self.canvas.horizontalScrollBar().setValue(int(self._restored_view.get("scroll_x", 0) or 0))
-        self.canvas.verticalScrollBar().setValue(int(self._restored_view.get("scroll_y", 0) or 0))
+        if "center_x" in self._restored_view and "center_y" in self._restored_view:
+            self.canvas.centerOn(
+                float(self._restored_view.get("center_x", 0.0) or 0.0),
+                float(self._restored_view.get("center_y", 0.0) or 0.0),
+            )
+        else:
+            self.canvas.horizontalScrollBar().setValue(int(self._restored_view.get("scroll_x", 0) or 0))
+            self.canvas.verticalScrollBar().setValue(int(self._restored_view.get("scroll_y", 0) or 0))
+        self.canvas.ensure_scene_space()
 
     def schedule_workspace_save(self) -> None:
         if self._workspace_enabled and self._workspace_ready and hasattr(self, "workspace_autosave"):
@@ -1494,6 +1683,7 @@ class MainWindow(QMainWindow):
             return
         try:
             history = list(self.agent.history) if self.agent else list(self._restored_agent_history)
+            view_center = self.canvas.mapToScene(self.canvas.viewport().rect().center())
             session = WorkspaceState(
                 project_path=self.project_path,
                 last_modpack_folder=self.last_modpack_folder or self.store.project.mod_folder,
@@ -1515,6 +1705,8 @@ class MainWindow(QMainWindow):
                 prompt=self.prompt.toPlainText(),
                 view={
                     "zoom": self.canvas.transform().m11(),
+                    "center_x": view_center.x(),
+                    "center_y": view_center.y(),
                     "scroll_x": self.canvas.horizontalScrollBar().value(),
                     "scroll_y": self.canvas.verticalScrollBar().value(),
                 },
@@ -1541,9 +1733,198 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         if self._workspace_enabled and not self.agent_busy and self.agent_thread is None:
             self._save_workspace_snapshot()
+        for thread in (self.scan_thread, self.icon_prewarm_thread, self.cache_cleanup_thread):
+            if thread is not None and thread.isRunning():
+                thread.requestInterruption()
+                thread.wait(2000)
         super().closeEvent(event)
 
+    def attach_game_bridge(self, bridge: StudioBridgeServer | None) -> None:
+        self.bridge_server = bridge
+        if bridge is None:
+            self.game_bridge_label.setText("游戏连接：本地桥启动失败，桌面编辑仍可使用")
+            return
+        self.game_bridge_label.setText(f"游戏连接：桥已就绪 · 本机端口 {bridge.port}")
+        self.bridge_status_timer = QTimer(self)
+        self.bridge_status_timer.setInterval(1000)
+        self.bridge_status_timer.timeout.connect(self._refresh_game_bridge_status)
+        self.bridge_status_timer.start()
+
+    def _refresh_game_bridge_status(self) -> None:
+        bridge = getattr(self, "bridge_server", None)
+        if bridge is None:
+            return
+        value = bridge.service.snapshot()
+        connected = (value.get("available") and value.get("project_id")
+                     and int(value.get("seconds_since_sync", 999)) < 30)
+        if connected and not self.agent_busy and self.agent_thread is None:
+            self._enter_game_backend_mode()
+        if self._game_backend_mode:
+            self.open_game_book_button.setEnabled(False)
+            self.sync_game_book_button.setEnabled(False)
+            if connected:
+                self.backend_status.setText(
+                    f"已连接 {value.get('loader', '')} {value.get('minecraft_version', '')} · "
+                    f"Mod {value.get('mod_version', '')}\n"
+                    f"选区：{value.get('selected_chapters', 0)} 章 / {value.get('selected_quests', 0)} 任务 · "
+                    + ("服务器允许编辑" if value.get('server_can_edit') else "服务器未授予编辑权限"))
+                self._refresh_backend_history(bridge.service, value)
+            else:
+                self.backend_status.setText("游戏连接已中断，等待重新连接。请在游戏中打开任务书。")
+            self._process_game_agent_requests()
+            return
+        if not value.get("available"):
+            self.open_game_book_button.setEnabled(False)
+            self.sync_game_book_button.setEnabled(False)
+            self._process_game_agent_requests()
+            return
+        loader = str(value.get("loader", "")).capitalize()
+        selected = int(value.get("selected_quests", 0) or 0)
+        chapter = str(value.get("chapter_title", "") or "未从选中任务确定章节")
+        age = int(value.get("seconds_since_sync", 0) or 0)
+        permission = ("可编辑 · 自动应用 · 可撤回"
+                      if value.get("server_can_edit") is True
+                      else "服务器未授予编辑权限")
+        self.game_bridge_label.setText(
+            f"游戏连接：{loader} {value.get('minecraft_version', '')} · "
+            f"FTBQ {value.get('ftb_quests_version', '')} · Mod {value.get('mod_version', '')}\n"
+            f"权限：{permission}\n"
+            f"最近同步：{chapter} · 选中 {selected} 个任务 · {age} 秒前"
+        )
+        has_snapshot = bridge.service.has_latest_book_snapshot()
+        self.open_game_book_button.setEnabled(has_snapshot and not self.agent_busy)
+        self.sync_game_book_button.setEnabled(
+            has_snapshot and self._live_game_base_payload is not None
+            and self._live_game_pending_payload is None and not self.agent_busy
+        )
+        self._sync_game_timeline()
+        self._process_game_agent_requests()
+
+    def _sync_game_timeline(self) -> None:
+        bridge = getattr(self, "bridge_server", None)
+        if bridge is None:
+            return
+        snapshot = bridge.service.snapshot()
+        session_id = str(snapshot.get("session_id", ""))
+        if not session_id:
+            session_id = getattr(bridge.service, "_latest_session_id", "")
+        if not session_id:
+            return
+        try:
+            events = bridge.service.events(session_id, self._game_event_cursor, 200)
+        except Exception:
+            LOGGER.exception("Unable to synchronize game project timeline")
+            return
+        for event in events:
+            self._game_event_cursor = max(self._game_event_cursor, int(event["event_id"]))
+            kind = str(event.get("kind", ""))
+            payload = event.get("payload", {})
+            self._applying_shared_events = True
+            try:
+                if kind == "chat.user" and event.get("origin") == "game":
+                    self.append_chat("user", "[游戏内] " + str(payload.get("text", "")))
+                elif (kind == "chat.assistant" and event.get("origin") == "studio"
+                      and payload.get("surface") != "studio"):
+                    # Game Agent answers are already rendered by its game-origin user event.
+                    self.append_chat("agent", "[游戏会话] " + str(payload.get("text", "")))
+                elif kind.startswith("work.") or kind.startswith("change."):
+                    self.append_action(kind, json.dumps(payload, ensure_ascii=False), refresh=False)
+            finally:
+                self._applying_shared_events = False
+            if kind == "change.applied" and self._live_game_pending_payload is not None:
+                self._live_game_base_payload = deepcopy(self._live_game_pending_payload)
+                self._live_game_pending_payload = None
+                self._live_game_revision = str(payload.get("server_book_revision", ""))
+                self.statusBar().showMessage("工作台修改已由游戏服务器应用，可在游戏内撤回", 7000)
+            elif kind in {"change.failed", "change.conflict", "change.undone"}:
+                self._live_game_pending_payload = None
+                if kind == "change.undone":
+                    self._live_game_base_payload = None
+                    self.statusBar().showMessage("游戏端已撤回修改，请重新载入实时任务书", 7000)
+
+    def open_live_game_book(self) -> None:
+        if self._game_backend_mode:
+            return
+        bridge = getattr(self, "bridge_server", None)
+        payload = bridge.service.latest_book_payload() if bridge is not None else None
+        if payload is None:
+            QMessageBox.information(self, "游戏任务书", "游戏端尚未上传完整任务书快照。")
+            return
+        try:
+            self.store = FTBQuestStore._from_project_payload(payload)
+            self.store.project.title = "游戏任务书 · " + self.store.project.title
+            self._live_game_base_payload = deepcopy(payload)
+            self._live_game_revision = str(payload.get("live_sync", {}).get("book_revision", ""))
+            self._live_game_pending_payload = None
+            self.project_path = ""
+            self.current_chapter_id = ""
+            self.current_quest_id = ""
+            self.agent = None
+            self.agent_context_chapter_ids.clear()
+            self.agent_context_quest_ids.clear()
+            self.refresh_all()
+            self.statusBar().showMessage("已切换到实时游戏任务书；编辑后点击“同步到游戏”", 7000)
+        except Exception as exc:
+            QMessageBox.critical(self, "载入游戏任务书失败", str(exc))
+
+    def sync_live_game_book(self) -> None:
+        if self._game_backend_mode:
+            return
+        bridge = getattr(self, "bridge_server", None)
+        if bridge is None or self._live_game_base_payload is None:
+            return
+        try:
+            desired = self.store._project_payload()
+            result = bridge.service.queue_studio_book({
+                "base_book_revision": self._live_game_revision,
+                "project": desired,
+                "summary": "Studio 工作台任务书修改",
+            })
+            if result.get("status") == "unchanged":
+                self.statusBar().showMessage("工作台任务书没有需要同步的修改", 5000)
+                return
+            self._live_game_pending_payload = deepcopy(desired)
+            self.sync_game_book_button.setEnabled(False)
+            self.statusBar().showMessage(
+                f"已发送 {result.get('operation_count', 0)} 项修改，等待游戏服务器应用", 7000,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "同步到游戏失败", str(exc))
+
+    def _process_game_agent_requests(self) -> None:
+        bridge = getattr(self, "bridge_server", None)
+        if bridge is None:
+            return
+        running = self.game_agent_task
+        if running is not None:
+            if running.is_alive():
+                return
+            self.game_agent_task = None
+        if self.agent_busy:
+            return
+        record = bridge.service.requests.take_next()
+        if record is None:
+            return
+        context = bridge.service.agent_context(record.session_id)
+        if context is None:
+            bridge.service.requests.fail(record.id, "游戏上下文已经失效，请重新同步后再试")
+            return
+        if not self.refresh_ai_state():
+            bridge.service.requests.fail(record.id, "Studio 尚未配置可用的 AI 模型")
+            return
+        try:
+            client = self._load_client()
+        except Exception as exc:
+            bridge.service.requests.fail(record.id, str(exc) or type(exc).__name__)
+            return
+        task = LiveProjectAgentTask(bridge.service, record, context, client,
+                                    asset_index=self.asset_index)
+        self.game_agent_task = task
+        task.start()
+
     def new_project(self):
+        if self._game_backend_mode:
+            return
         if QMessageBox.question(self, "新建项目", "创建新项目？未保存的修改将丢失。") == QMessageBox.StandardButton.Yes:
             self.store = self._starter_store()
             self.project_path = ""
@@ -1555,7 +1936,9 @@ class MainWindow(QMainWindow):
             self.refresh_all()
 
     def open_project(self):
-        path, _ = QFileDialog.getOpenFileName(self, "打开 AutoFTBQ 项目", "", PROJECT_FILTER)
+        if self._game_backend_mode:
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "打开 AutoFTBQ Studio 项目", "", PROJECT_FILTER)
         if not path:
             return
         try:
@@ -1571,6 +1954,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "打开失败", str(exc))
 
     def save_project(self):
+        if self._game_backend_mode:
+            return
         self.save_project_title()
         if getattr(self.store, "is_real", False):
             try:
@@ -1585,7 +1970,7 @@ class MainWindow(QMainWindow):
             return
         path = self.project_path
         if not path:
-            path, _ = QFileDialog.getSaveFileName(self, "保存 AutoFTBQ 项目", "questbook.autoftbq.json", PROJECT_FILTER)
+            path, _ = QFileDialog.getSaveFileName(self, "保存 AutoFTBQ Studio 项目", "questbook.autoftbq.json", PROJECT_FILTER)
         if not path:
             return
         try:
@@ -1598,7 +1983,10 @@ class MainWindow(QMainWindow):
 
     def scan_modpack(self):
         if self.scan_thread is not None:
-            self.statusBar().showMessage("整合包仍在后台扫描中", 3000)
+            self.scan_thread.requestInterruption()
+            self.scan_button.setEnabled(False)
+            self.scan_button.setText("正在停止资源恢复…")
+            self.statusBar().showMessage("正在停止资源恢复，请稍候", 3000)
             return
         selected_folder = QFileDialog.getExistingDirectory(
             self, "选择整合包根目录或 mods 文件夹", self.store.project.mod_folder
@@ -1643,8 +2031,8 @@ class MainWindow(QMainWindow):
         self._scan_preserve_store = preserve_store
         self.last_modpack_folder = folder
         self.store.project.mod_folder = folder
-        self.scan_button.setEnabled(False)
-        self.scan_button.setText("自动恢复资源中…" if automatic else "后台扫描中…")
+        self.scan_button.setEnabled(True)
+        self.scan_button.setText("停止自动恢复" if automatic else "停止后台扫描")
         self.modpack_status.setText(
             ("正在自动恢复上次整合包资源…" if automatic else "正在准备后台扫描…")
             + "\n界面可以继续操作"
@@ -1658,6 +2046,7 @@ class MainWindow(QMainWindow):
         thread.progress.connect(self._scan_progress)
         thread.completed.connect(self._scan_completed)
         thread.failed.connect(self._scan_failed)
+        thread.cancelled.connect(self._scan_cancelled)
         thread.finished.connect(self._scan_finished)
         self.scan_thread = thread
         thread.start()
@@ -1665,13 +2054,22 @@ class MainWindow(QMainWindow):
         return True
 
     def _scan_progress(self, message: str):
+        now = time.monotonic()
+        if str(message).startswith("扫描模组 ") and now - self._scan_last_progress_at < 0.1:
+            return
+        self._scan_last_progress_at = now
         self.modpack_status.setText(f"{message}\n界面可以继续操作")
 
     def _scan_completed(self, result: dict):
         folder = result["folder"]
         items = result["items"]
-        self.toolbox = QuestToolbox(items, result["recipes"])
         self.asset_index = result["asset_index"]
+        availability_reader = getattr(self.asset_index, "agent_availability_map", None)
+        self.toolbox = QuestToolbox(
+            items, result["recipes"],
+            availability=availability_reader() if callable(availability_reader) else {},
+        )
+        self.icon_pixmap_cache.clear()
         self.refresh_shape_choices()
         self.update_target_preview()
         store = result["store"]
@@ -1693,17 +2091,110 @@ class MainWindow(QMainWindow):
                 loaded_text = "\n已自动恢复上次整合包资源，未覆盖当前草稿"
         total = sum(len(value) for value in items.values())
         assets = self.asset_index.summary()
+        agent_allowed = int(assets.get("agent_allowed", total))
+        isolated = int(assets.get("agent_blocked", 0)) + int(assets.get("agent_uncertain", 0))
         self.modpack_status.setText(
             f"已读取 {len(items)} 个命名空间 / {total} 个物品\n"
-            f"已建立 {assets['resources']} 项资源目录，图标按需解析"
+            f"Agent 安全物品 {agent_allowed} 个，隔离可疑物品 {isolated} 个\n"
+            f"已建立 {assets['resources']} 项资源目录，任务图标正在后台准备"
             f"{loaded_text}"
         )
         self.agent = None
         self.append_action("scan_modpack", f"{total} items")
         self.refresh_all()
+        self._start_icon_prewarm()
+        self._start_cache_cleanup()
         if not self._scan_preserve_store:
             self.fit_canvas()
         self.schedule_workspace_save()
+
+    def _quest_icon_ids(self) -> list[str]:
+        chapters = list(self.store.project.chapters)
+        if self.current_chapter_id:
+            chapters.sort(key=lambda chapter: chapter.id != self.current_chapter_id)
+        result = []
+        for chapter in chapters:
+            for quest in chapter.quests:
+                task = quest.tasks[0] if quest.tasks else None
+                icon_id = quest.icon or (task.target if task else "")
+                if icon_id and icon_id not in result:
+                    result.append(icon_id)
+        return result
+
+    def _chapter_image_ids(self) -> list[str]:
+        result = []
+        if not hasattr(self.store, "chapter_data"):
+            return result
+        for chapter in self.store.project.chapters:
+            raw = self.store.chapter_data(chapter.id)
+            images = raw.get("images", []) if isinstance(raw, dict) else []
+            for value in images if isinstance(images, list) else []:
+                image_id = str(value.get("image") or "") if isinstance(value, dict) else ""
+                if image_id and image_id not in result:
+                    result.append(image_id)
+        return result
+
+    def _start_icon_prewarm(self) -> None:
+        if self.asset_index is None:
+            return
+        previous = self.icon_prewarm_thread
+        if previous is not None and previous.isRunning():
+            previous.requestInterruption()
+        worker = IconPrewarmWorker(
+            self.asset_index, self._quest_icon_ids(), self._chapter_image_ids(), self,
+        )
+        worker.icon_ready.connect(
+            lambda item_id, path, source=worker: self._icon_prewarm_ready(source, item_id, path)
+        )
+        worker.completed.connect(
+            lambda count, source=worker: self._icon_prewarm_completed(source, count)
+        )
+        worker.finished.connect(lambda source=worker: self._icon_prewarm_finished(source))
+        self.icon_prewarm_thread = worker
+        worker.start()
+
+    def _icon_prewarm_ready(self, source, item_id: str, path: str) -> None:
+        if source is not self.icon_prewarm_thread:
+            return
+        for item in self.scene.items():
+            if isinstance(item, QuestNode) and item.icon_id == item_id:
+                item.set_icon_path(path)
+
+    def _icon_prewarm_completed(self, source, count: int) -> None:
+        if source is not self.icon_prewarm_thread:
+            return
+        self.refresh_canvas()
+        if count:
+            self.statusBar().showMessage(f"已在后台准备 {count} 个任务图标", 3000)
+
+    def _icon_prewarm_finished(self, source) -> None:
+        if source is self.icon_prewarm_thread:
+            self.icon_prewarm_thread = None
+        source.deleteLater()
+
+    def _start_cache_cleanup(self) -> None:
+        if (self.asset_index is None or self.cache_cleanup_thread is not None
+                or not callable(getattr(self.asset_index, "cleanup_cache", None))):
+            return
+        worker = CacheCleanupWorker(self.asset_index, self)
+        worker.completed.connect(
+            lambda result, source=worker: self._cache_cleanup_completed(source, result)
+        )
+        worker.finished.connect(lambda source=worker: self._cache_cleanup_finished(source))
+        self.cache_cleanup_thread = worker
+        worker.start()
+
+    def _cache_cleanup_completed(self, source, result: dict) -> None:
+        if source is not self.cache_cleanup_thread:
+            return
+        removed = int((result or {}).get("removed", 0))
+        if removed:
+            logging.getLogger(LOGGER_NAME).info("Removed %s stale icon cache files", removed)
+
+    def _cache_cleanup_finished(self, source) -> None:
+        if source is self.cache_cleanup_thread:
+            self.cache_cleanup_thread = None
+        source.deleteLater()
 
     def refresh_shape_choices(self) -> None:
         current = str(self.quest_shape.currentData() or "")
@@ -1723,6 +2214,10 @@ class MainWindow(QMainWindow):
         if not self._automatic_scan:
             QMessageBox.critical(self, "扫描失败", message)
 
+    def _scan_cancelled(self):
+        self.modpack_status.setText("资源恢复已停止\n可以随时重新扫描整合包")
+        self.statusBar().showMessage("资源恢复已停止", 3000)
+
     def _scan_finished(self):
         thread = self.scan_thread
         self.scan_thread = None
@@ -1734,7 +2229,9 @@ class MainWindow(QMainWindow):
             thread.deleteLater()
 
     def run_validation(self):
-        issues = self.store.validate(self.toolbox.all_items)
+        issues = list(self.store.validate(self.toolbox.all_items))
+        if self.asset_index is not None:
+            issues.extend(AgentItemPolicy(self.store, self.asset_index).existing_warnings())
         self.validation_list.clear()
         if not issues:
             self.validation_list.addItem("通过：没有发现结构问题")
@@ -1745,6 +2242,8 @@ class MainWindow(QMainWindow):
         return issues
 
     def export_snbt(self):
+        if self._game_backend_mode:
+            return
         issues = self.run_validation()
         errors = [issue for issue in issues if issue["severity"] == "error"]
         if errors:
@@ -1824,6 +2323,8 @@ class MainWindow(QMainWindow):
             self.open_ai_setup(required=True)
 
     def send_to_agent(self):
+        if self._game_backend_mode:
+            return
         prompt = self.prompt.toPlainText().strip()
         if not prompt:
             return
@@ -1878,6 +2379,7 @@ class MainWindow(QMainWindow):
         if busy and self.connect_button.isChecked():
             self.connect_button.setChecked(False)
         if busy:
+            self._agent_attention_message = ""
             self._agent_control_states = {
                 control: control.isEnabled() for control in self.agent_write_controls
             }
@@ -1958,10 +2460,9 @@ class MainWindow(QMainWindow):
             self.agent.rollback_transaction()
         if retained:
             self.refresh_all()
-            self.agent_progress_bar.setRange(0, 3)
-            self.agent_progress_bar.setValue(2)
-            self.agent_progress_bar.setFormat("执行中断 · 检查点已保留")
-            self.agent_current_label.setText("当前：可发送“继续”恢复执行")
+            self._agent_attention_message = "当前：检查点已保留，可发送“继续”恢复执行"
+            self.agent_panel.set_progress_idle()
+            self.agent_current_label.setText(self._agent_attention_message)
         self.append_chat("error", message)
 
     def agent_finished(self):
@@ -1981,8 +2482,13 @@ class MainWindow(QMainWindow):
         if next_prompt:
             self.prompt.setPlainText(next_prompt)
             QTimer.singleShot(0, self.send_to_agent)
+        else:
+            self.agent_panel.set_progress_idle()
+            if self._agent_attention_message:
+                self.agent_current_label.setText(self._agent_attention_message)
 
-    def append_action(self, name, detail, refresh=True):
+    def _render_action(self, name, detail) -> None:
+        """Render one technical-history row without changing live Agent state."""
         labels = {
             "get_project_summary": "读取项目",
             "get_chapter_quests": "读取章节任务",
@@ -1994,6 +2500,7 @@ class MainWindow(QMainWindow):
             "agent_checkpoint": "建立安全检查点",
             "agent_checkpoint_rollback": "撤销安全检查点",
             "agent_tool_rejected": "拒绝不安全修改",
+            "agent_id_unverified": "ID 未查询提示",
             "create_chapter": "创建章节",
             "add_quest": "添加任务",
             "add_quest_chain": "批量创建任务链",
@@ -2014,11 +2521,14 @@ class MainWindow(QMainWindow):
             "scan_modpack": "扫描整合包",
         }
         full_text = f"{labels.get(name, name)}  {detail}"
-        self.action_records.append({"name": str(name), "detail": str(detail)})
-        self.action_records = self.action_records[-500:]
         item = QListWidgetItem(full_text[:120])
         item.setToolTip(full_text)
         self.action_list.insertItem(0, item)
+
+    def append_action(self, name, detail, refresh=True):
+        self.action_records.append({"name": str(name), "detail": str(detail)})
+        self.action_records = self.action_records[-500:]
+        self._render_action(name, detail)
         self.update_agent_progress(name, detail)
         if refresh and name in {
             "create_chapter", "add_quest", "add_quest_chain", "update_quest", "replace_quest_sections",
@@ -2026,12 +2536,39 @@ class MainWindow(QMainWindow):
         }:
             self.refresh_all()
         self.schedule_workspace_save()
+        if self._live_game_base_payload is not None and not self._applying_shared_events:
+            bridge = getattr(self, "bridge_server", None)
+            identity = bridge.service.snapshot() if bridge is not None else {}
+            if identity.get("project_id") and identity.get("conversation_id"):
+                bridge.service.shared_state.append_event(
+                    identity["project_id"], identity["conversation_id"],
+                    "work.studio", "studio", {"name": str(name), "detail": str(detail)},
+                )
 
     def append_chat(self, role, text):
         self.chat_records.append({"role": str(role), "text": str(text)})
         self.chat_records = self.chat_records[-300:]
         self._render_chat(role, text)
         self.schedule_workspace_save()
+        if self._live_game_base_payload is None or self._applying_shared_events:
+            return
+        bridge = getattr(self, "bridge_server", None)
+        identity = bridge.service.snapshot() if bridge is not None else {}
+        if not identity.get("project_id") or not identity.get("conversation_id"):
+            return
+        normalized_role = "user" if role == "user" else "assistant"
+        if normalized_role == "user":
+            request_id = "studio-" + secrets.token_urlsafe(12)
+            self._shared_studio_request_ids.append(request_id)
+            kind = "chat.user"
+        else:
+            request_id = (self._shared_studio_request_ids.pop(0)
+                          if self._shared_studio_request_ids else "studio-" + secrets.token_urlsafe(12))
+            kind = "chat.assistant"
+        bridge.service.shared_state.append_event(
+            identity["project_id"], identity["conversation_id"], kind, "studio",
+            {"request_id": request_id, "text": str(text), "surface": "studio"},
+        )
 
     def _render_chat(self, role, text):
         safe = escape(str(text)).replace("\n", "<br>")
@@ -2062,14 +2599,52 @@ class MainWindow(QMainWindow):
 def run_app():
     logger, log_path = configure_logging(ROOT_DIR)
     install_exception_hooks(logger)
-    logger.info("Starting AutoFTBQ v2; log=%s", log_path)
+    logger.info("Starting AutoFTBQ Studio; log=%s", log_path)
     app = QApplication.instance() or QApplication([])
     app.setStyle("Fusion")
     apply_light_palette(app)
     if not hasattr(app, "_autoftbq_form_wheel_filter"):
         app._autoftbq_form_wheel_filter = FormWheelNavigationFilter(app)
         app.installEventFilter(app._autoftbq_form_wheel_filter)
+    bridge = None
+    try:
+        bridge = StudioBridgeServer().start()
+        logger.info("Game bridge listening on 127.0.0.1:%s", bridge.port)
+    except OSError:
+        logger.exception("Unable to start the local game bridge")
     window = MainWindow(restore_workspace=True)
+    window.attach_game_bridge(bridge)
     window.show()
     QTimer.singleShot(0, window.ensure_ai_setup)
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        if bridge is not None:
+            bridge.stop()
+
+
+def smoke_test_app() -> int:
+    """Initialize the packaged Qt window and bridge without displaying a UI."""
+    logger, _log_path = configure_logging(ROOT_DIR)
+    app = QApplication.instance() or QApplication([])
+    app.setStyle("Fusion")
+    apply_light_palette(app)
+    bridge = None
+    window = None
+    try:
+        bridge = StudioBridgeServer().start()
+        window = MainWindow(restore_workspace=False)
+        window.attach_game_bridge(bridge)
+        window.show()
+        app.processEvents()
+        ready = window.windowTitle() == "AutoFTBQ Studio" and bridge.port > 0
+        logger.info("Packaged startup smoke test: %s", "passed" if ready else "failed")
+        return 0 if ready else 2
+    except Exception:
+        logger.exception("Packaged startup smoke test failed")
+        return 3
+    finally:
+        if window is not None:
+            window.close()
+        if bridge is not None:
+            bridge.stop()

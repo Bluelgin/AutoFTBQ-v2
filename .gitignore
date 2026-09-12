@@ -40,6 +40,8 @@ nul
 Thumbs.db
 
 # Cache
+**/.gradle/
+game-mod/run/
 _modrinth_cache/
 _wiki_cache/
 .autoftbq_cache/

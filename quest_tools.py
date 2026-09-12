@@ -13,10 +13,17 @@ def _normalized(value: object) -> str:
 class QuestToolbox:
     """Small structured queries used by generation today and tool calling later."""
 
-    def __init__(self, all_items=None, recipe_inputs=None, documents=None):
+    def __init__(self, all_items=None, recipe_inputs=None, documents=None, availability=None):
         self.all_items = all_items or {}
         self.recipe_inputs = recipe_inputs or {}
         self.documents = list(documents or [])
+        self.availability = dict(availability or {})
+
+    def item_is_agent_allowed(self, item_id: str) -> bool:
+        if not self.availability:
+            return True
+        value = self.availability.get(str(item_id), {})
+        return bool(value.get("allowed")) if isinstance(value, dict) else False
 
     def search_items(self, namespace="", query="", limit=30) -> list[dict]:
         namespace = str(namespace or "").strip().lower()
@@ -29,6 +36,8 @@ class QuestToolbox:
             if not isinstance(items, dict):
                 continue
             for item_id, display_name in items.items():
+                if not self.item_is_agent_allowed(item_id):
+                    continue
                 haystacks = (_normalized(item_id), _normalized(display_name))
                 if needle and not any(needle in value for value in haystacks):
                     continue
@@ -91,7 +100,13 @@ class QuestToolbox:
         items = self.all_items.get(namespace, {})
         if not isinstance(items, dict) or item_id not in items:
             return None
-        return {"item_id": item_id, "name": str(items[item_id]), "namespace": namespace}
+        result = {"item_id": item_id, "name": str(items[item_id]), "namespace": namespace}
+        if self.availability:
+            status = self.availability.get(item_id, {})
+            result["agent_allowed"] = bool(status.get("allowed"))
+            result["availability"] = str(status.get("status", "blocked"))
+            result["reasons"] = list(status.get("reasons", []))
+        return result
 
     def get_recipe(self, item_id: str, depth=1) -> dict:
         item_id = str(item_id or "").strip()
@@ -122,7 +137,7 @@ class QuestToolbox:
             namespace = item_id.split(":", 1)[0]
             items = self.all_items.get(namespace)
             if isinstance(items, dict) and item_id in items:
-                status = "valid"
+                status = "valid" if self.item_is_agent_allowed(item_id) else "unsafe"
             elif namespace in self.all_items:
                 status = "unknown"
             else:

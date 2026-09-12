@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import html
 import json
 import logging
+import re
 import time
 from typing import Protocol
 
@@ -25,6 +27,16 @@ RETRY_DELAY = 3
 MAX_TOOL_ROUNDS = 24
 MAX_TOOL_CALLS = 48
 LOGGER = logging.getLogger("autoftbq.v2")
+
+_XML_TOOL_BLOCK = re.compile(r"<tool_call\b[^>]*>(.*?)</tool_call>", re.IGNORECASE | re.DOTALL)
+_XML_FUNCTION = re.compile(
+    r"<function\s*=\s*[\"']?([A-Za-z_][A-Za-z0-9_.:-]*)[\"']?\s*>(.*?)</function>",
+    re.IGNORECASE | re.DOTALL,
+)
+_XML_PARAMETER = re.compile(
+    r"<parameter\s*=\s*[\"']?([A-Za-z_][A-Za-z0-9_.:-]*)[\"']?\s*>(.*?)</parameter>",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 class ChatClient(Protocol):
@@ -100,6 +112,85 @@ def _safe_response_shape(payload) -> dict:
     }
 
 
+def _parse_text_tool_value(value: str):
+    text = html.unescape(value).strip()
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return text
+
+
+def _message_tool_calls(message: dict, round_index: int, allowed_names: set[str]):
+    """Normalize native, legacy, and MiMo/Qwen-style XML tool calls."""
+    tool_calls = message.get("tool_calls")
+    legacy_call = message.get("function_call")
+    if (not isinstance(tool_calls, list) or not tool_calls) and isinstance(legacy_call, dict):
+        tool_calls = [{
+            "id": f"legacy_call_{round_index}",
+            "type": "function",
+            "function": legacy_call,
+        }]
+    if isinstance(tool_calls, list) and tool_calls:
+        return tool_calls, False
+
+    content = _content_text(message.get("content")) or ""
+    parsed = []
+    for block_index, block in enumerate(_XML_TOOL_BLOCK.findall(content)):
+        function_match = _XML_FUNCTION.search(block)
+        if function_match is None:
+            continue
+        name, body = function_match.groups()
+        if name not in allowed_names:
+            LOGGER.warning("Ignoring textual call to unknown tool: %s", name)
+            continue
+        arguments = {
+            key: _parse_text_tool_value(raw)
+            for key, raw in _XML_PARAMETER.findall(body)
+        }
+        parsed.append({
+            "id": f"text_call_{round_index}_{block_index}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(arguments, ensure_ascii=False),
+            },
+        })
+    if parsed:
+        LOGGER.info("Normalized %s textual XML tool call(s)", len(parsed))
+    return parsed, bool(parsed)
+
+
+def _append_tool_trace(trace_sink, name: str, arguments: dict, result) -> None:
+    if not isinstance(trace_sink, list):
+        return
+    raw = str(result)
+    try:
+        parsed_result = json.loads(raw)
+    except (TypeError, ValueError):
+        parsed_result = raw
+    item = {"tool": str(name), "arguments": dict(arguments), "result": parsed_result}
+    encoded = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > 40 * 1024:
+        item["result"] = {
+            "truncated": True,
+            "preview": raw[:20_000],
+        }
+    existing_bytes = len(json.dumps(
+        trace_sink, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8"))
+    item_bytes = len(json.dumps(
+        item, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8"))
+    if existing_bytes + item_bytes <= 96 * 1024:
+        trace_sink.append(item)
+    elif not trace_sink or trace_sink[-1].get("tool") != "trace_limit":
+        trace_sink.append({
+            "tool": "trace_limit",
+            "arguments": {},
+            "result": {"truncated": True, "message": "更多查询结果已省略"},
+        })
+
+
 class GenericOpenAIClient:
     """Minimal OpenAI Chat Completions compatible client."""
 
@@ -111,6 +202,7 @@ class GenericOpenAIClient:
         timeout=API_TIMEOUT,
         omit_temperature=False,
         request_overrides=None,
+        reasoning_effort="auto",
     ):
         if not api_url:
             raise ValueError("未配置 API URL")
@@ -121,11 +213,12 @@ class GenericOpenAIClient:
         self.timeout = timeout
         self.omit_temperature = omit_temperature
         self.request_overrides = dict(request_overrides or {})
+        self.reasoning_effort = str(reasoning_effort or "auto").strip().casefold()
         self._tool_support = None
         self.headers = {
             "Authorization": f"Bearer {str(api_key).strip()}",
             "Content-Type": "application/json",
-            "User-Agent": "AutoFTBQ",
+            "User-Agent": "AutoFTBQ-Studio",
         }
 
     def _payload(self, messages, temperature, max_tokens):
@@ -138,6 +231,8 @@ class GenericOpenAIClient:
         if not self.omit_temperature:
             payload["temperature"] = temperature
         payload.update(self.request_overrides)
+        if self.reasoning_effort in {"low", "medium", "high"}:
+            payload["reasoning"] = {"effort": self.reasoning_effort}
         return payload
 
     def _post(self, payload):
@@ -236,27 +331,44 @@ class GenericOpenAIClient:
         temperature=0.7,
         max_tokens=8192,
         max_rounds=3,
+        tool_choice="auto",
+        trace_sink=None,
     ):
         """Run a bounded tool loop, falling back once when a provider rejects tools."""
         if self._tool_support is False or not tools:
             return self.chat(messages, temperature, max_tokens)
         conversation = [dict(message) for message in messages]
+        allowed_names = {
+            str(tool.get("function", {}).get("name", ""))
+            for tool in tools if isinstance(tool, dict)
+        }
         tool_call_count = 0
         for round_index in range(max(1, min(int(max_rounds), MAX_TOOL_ROUNDS))):
             payload = self._payload(conversation, temperature, max_tokens)
             payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+            payload["tool_choice"] = tool_choice if tool_call_count == 0 else "auto"
             try:
                 body = self._post(payload)
             except RuntimeError as exc:
-                unsupported = any(
-                    marker in str(exc)
-                    for marker in ("HTTP 400", "HTTP 403", "HTTP 404", "HTTP 422")
-                )
-                if unsupported:
-                    self._tool_support = False
-                    return self.chat(messages, temperature, max_tokens)
-                raise
+                if tool_choice != "auto" and tool_call_count == 0:
+                    payload["tool_choice"] = "auto"
+                    try:
+                        body = self._post(payload)
+                    except RuntimeError as retry_error:
+                        exc = retry_error
+                    else:
+                        exc = None
+                if exc is None:
+                    pass
+                else:
+                    unsupported = any(
+                        marker in str(exc)
+                        for marker in ("HTTP 400", "HTTP 403", "HTTP 404", "HTTP 422")
+                    )
+                    if unsupported:
+                        self._tool_support = False
+                        return self.chat(messages, temperature, max_tokens)
+                    raise exc
             choices = body.get("choices")
             if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
                 self._tool_support = False
@@ -265,20 +377,36 @@ class GenericOpenAIClient:
             if not isinstance(message, dict):
                 self._tool_support = False
                 return self.chat(messages, temperature, max_tokens)
-            tool_calls = message.get("tool_calls")
-            legacy_call = message.get("function_call")
-            if (not isinstance(tool_calls, list) or not tool_calls) and isinstance(legacy_call, dict):
-                tool_calls = [{
-                    "id": f"legacy_call_{round_index}",
-                    "type": "function",
-                    "function": legacy_call,
-                }]
+            tool_calls, textual_calls = _message_tool_calls(
+                message, round_index, allowed_names,
+            )
             if not isinstance(tool_calls, list) or not tool_calls:
                 try:
                     result = _response_content(body)
                 except (TypeError, ValueError) as exc:
-                    LOGGER.warning("AI tool loop returned no visible text: shape=%s", _safe_response_shape(body))
-                    result = self._recover_visible_content(conversation, temperature, max_tokens, body)
+                    shape = _safe_response_shape(body)
+                    LOGGER.warning("AI tool loop returned no visible text: shape=%s", shape)
+                    if tool_call_count:
+                        exhausted = shape.get("finish_reason") == "length"
+                        LOGGER.warning("Using local completion status after %s tool calls", tool_call_count)
+                        result = ((
+                            "模型输出预算已耗尽，查询已完成但尚未生成最终事务。"
+                            if exhausted else
+                            "工具操作已完成，请在编辑器中检查结果。"
+                        ), exhausted)
+                    else:
+                        result = self._recover_visible_content(conversation, temperature, max_tokens, body)
+                if "<tool_call" in result[0].lower():
+                    LOGGER.warning("AI exposed unrecognized tool markup; requesting a valid call")
+                    conversation.append({"role": "assistant", "content": ""})
+                    conversation.append({
+                        "role": "user",
+                        "content": (
+                            "The previous textual tool call was invalid. Use only the supplied "
+                            "native tools with valid arguments, or return a normal final answer."
+                        ),
+                    })
+                    continue
                 self._tool_support = True
                 return result
             self._tool_support = True
@@ -291,6 +419,8 @@ class GenericOpenAIClient:
             bounded_message = dict(message)
             bounded_message.setdefault("role", "assistant")
             bounded_message.pop("function_call", None)
+            if textual_calls:
+                bounded_message["content"] = ""
             bounded_message["tool_calls"] = bounded_calls
             conversation.append(bounded_message)
             for call in bounded_calls:
@@ -304,6 +434,7 @@ class GenericOpenAIClient:
                     result = tool_handler(name, arguments)
                 except Exception as exc:
                     result = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                _append_tool_trace(trace_sink, name, arguments, result)
                 conversation.append({
                     "role": "tool",
                     "tool_call_id": str(call.get("id", f"tool_{round_index}")),
@@ -312,20 +443,80 @@ class GenericOpenAIClient:
                 })
             if tool_call_count >= MAX_TOOL_CALLS:
                 break
-        conversation.append({
-            "role": "user",
-            "content": (
-                "Stop calling tools. Using the tool results already provided, "
-                "return the final answer in the exact format requested by the original prompt."
-            ),
-        })
-        payload = self._payload(conversation, temperature, max_tokens)
-        body = self._post(payload)
-        try:
-            return _response_content(body)
-        except (TypeError, ValueError):
-            LOGGER.warning("AI final synthesis returned no visible text: shape=%s", _safe_response_shape(body))
-            return self._recover_visible_content(conversation, temperature, max_tokens, body)
+        for recovery_index in range(3):
+            conversation.append({
+                "role": "user",
+                "content": (
+                    "Stop calling tools unless one final lookup is strictly required. "
+                    "Using the tool results already provided, return the final answer in the "
+                    "exact format requested by the original prompt. Never print tool-call markup."
+                ),
+            })
+            payload = self._payload(conversation, temperature, max_tokens)
+            body = self._post(payload)
+            choices = body.get("choices") if isinstance(body, dict) else None
+            message = choices[0].get("message") if (
+                isinstance(choices, list) and choices and isinstance(choices[0], dict)
+            ) else None
+            if isinstance(message, dict) and tool_call_count < MAX_TOOL_CALLS:
+                tool_calls, textual_calls = _message_tool_calls(
+                    message, max_rounds + recovery_index, allowed_names,
+                )
+                remaining_calls = MAX_TOOL_CALLS - tool_call_count
+                bounded_calls = [
+                    call for call in tool_calls if isinstance(call, dict)
+                ][:min(6, remaining_calls)]
+                if bounded_calls:
+                    tool_call_count += len(bounded_calls)
+                    bounded_message = dict(message)
+                    bounded_message.setdefault("role", "assistant")
+                    bounded_message.pop("function_call", None)
+                    if textual_calls:
+                        bounded_message["content"] = ""
+                    bounded_message["tool_calls"] = bounded_calls
+                    conversation.append(bounded_message)
+                    for call in bounded_calls:
+                        function = call.get("function", {})
+                        name = str(function.get("name", ""))
+                        try:
+                            arguments = json.loads(function.get("arguments", "{}") or "{}")
+                        except (TypeError, ValueError):
+                            arguments = {}
+                        try:
+                            result = tool_handler(name, arguments)
+                        except Exception as exc:
+                            result = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                        _append_tool_trace(trace_sink, name, arguments, result)
+                        conversation.append({
+                            "role": "tool",
+                            "tool_call_id": str(call.get("id", f"recovery_{recovery_index}")),
+                            "name": name,
+                            "content": str(result),
+                        })
+                    continue
+            try:
+                result = _response_content(body)
+                if "<tool_call" not in result[0].lower():
+                    return result
+                LOGGER.warning("AI final synthesis exposed tool markup; retrying")
+            except (TypeError, ValueError):
+                LOGGER.warning(
+                    "AI final synthesis returned no visible text: shape=%s",
+                    _safe_response_shape(body),
+                )
+            if recovery_index == 2:
+                recovered = self._recover_visible_content(
+                    conversation, temperature, max_tokens, body,
+                )
+                if "<tool_call" in recovered[0].lower():
+                    LOGGER.error("AI repeatedly exposed tool markup; returning safe failure text")
+                    return (
+                        "模型连续返回了无法完成的工具请求，本次没有应用任何修改。"
+                        "请缩小处理范围后重试。",
+                        False,
+                    )
+                return recovered
+        raise RuntimeError("AI tool loop did not produce a final answer")
 
 
 class DeepSeekClient(GenericOpenAIClient):
@@ -340,7 +531,10 @@ class DeepSeekClient(GenericOpenAIClient):
         )
 
 
-def create_chat_client(engine, api_key=None, ollama_model=None, provider=None, api_url=None, api_model=None):
+def create_chat_client(
+    engine, api_key=None, ollama_model=None, provider=None, api_url=None, api_model=None,
+    reasoning_effort="auto",
+):
     """Create a client while keeping legacy engine names compatible."""
     if engine == "ollama":
         return ollama_adapter.OllamaClient(model=ollama_model or "qwen2.5-coder:7b")
@@ -364,4 +558,5 @@ def create_chat_client(engine, api_key=None, ollama_model=None, provider=None, a
         final_model,
         omit_temperature=preset.get("omit_temperature", False) if uses_preset else False,
         request_overrides=preset.get("request_overrides") if uses_preset else None,
+        reasoning_effort=reasoning_effort,
     )

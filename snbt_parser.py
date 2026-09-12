@@ -9,6 +9,7 @@ serializes plain Python values back into the same relaxed syntax.
 from __future__ import annotations
 
 import re
+import math
 from typing import Any
 
 
@@ -307,3 +308,51 @@ def to_snbt(value: Any, indent: int = 4) -> str:
     if isinstance(value, list):
         return _snbt_list(value, indent, 0)
     return _snbt_value(value, indent, 0)
+
+
+def to_strict_snbt(value: Any) -> str:
+    """Serialize game transport for Mojang TagParser, not the relaxed file reader.
+
+    Brigadier only accepts quote/backslash escapes; control characters stay
+    literal inside quoted strings (the outer JSON transport escapes them).
+    Reject values which NBT cannot represent instead of silently changing type.
+    """
+    def quote(text):
+        return '"' + text.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+    def encode(item):
+        if isinstance(item, str):
+            return quote(item), 'string'
+        if isinstance(item, bool):
+            return ('1b' if item else '0b'), 'byte'
+        for cls, suffix, bits, kind in (
+            (_SNBTByte, 'b', 8, 'byte'), (_SNBTShort, 's', 16, 'short'),
+            (_SNBTLong, 'L', 64, 'long'), (int, '', 32, 'int'),
+        ):
+            if isinstance(item, cls):
+                number = int(item)
+                if not -(1 << (bits - 1)) <= number < (1 << (bits - 1)):
+                    raise ValueError(f'NBT {kind} out of range: {number}')
+                return str(number) + suffix, kind
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise ValueError('NBT transport requires finite numbers')
+            return repr(float(item)) + 'd', 'double'
+        if isinstance(item, dict):
+            if any(not isinstance(key, str) for key in item):
+                raise ValueError('NBT compound keys must be strings')
+            return '{' + ','.join(quote(k) + ':' + encode(v)[0] for k, v in item.items()) + '}', 'compound'
+        if isinstance(item, _SNBTTypedArray):
+            constructors = {'B': _SNBTByte, 'I': int, 'L': _SNBTLong}
+            if item.kind not in constructors or any(type(v) is bool or not isinstance(v, int) for v in item):
+                raise ValueError('Invalid NBT typed array')
+            values = [encode(constructors[item.kind](v))[0] for v in item]
+            return '[' + item.kind + ';' + ','.join(values) + ']', item.kind + '_array'
+        if isinstance(item, list):
+            values = [encode(v) for v in item]
+            if len({kind for _, kind in values}) > 1:
+                raise ValueError('NBT lists must contain a single tag type')
+            return '[' + ','.join(text for text, _ in values) + ']', 'list'
+        raise ValueError(f'Unsupported NBT value: {type(item).__name__}')
+
+    return encode(value)[0]

@@ -141,6 +141,23 @@ class V2AgentTests(unittest.TestCase):
         self.assertEqual((typed.value, typed.target), ("checkmark", 6))
         self.assertEqual(row_wrap.target, 4)
 
+    def test_improve_request_does_not_turn_crafting_object_into_new_chapter_work(self):
+        request = (
+            "[AutoFTBQ 结构化请求]\n"
+            "执行模式：改进\n"
+            "用户要求：把每个boss任务的图标改成对应掉落物，完成条件还要制作召唤物\n"
+            "目标范围：章节：Boss挑战\n"
+            "权限边界：只能修改上述明确作用域。"
+        )
+
+        plan = build_run_plan(request, FTBQuestStore.create_new(with_starter=False))
+        kinds = {criterion.kind for criterion in plan.criteria}
+
+        self.assertIn("mutation", kinds)
+        self.assertNotIn("chapters_added", kinds)
+        self.assertNotIn("quests_added", kinds)
+        self.assertNotIn("new_quests_typed", kinds)
+
     def test_plan_treats_all_gameplay_chapter_as_substantial_work(self):
         plan = build_run_plan(
             "建议一个章节，内容包含全部机械动力玩法，由入门到精通，太长就换到下一行",
@@ -233,6 +250,33 @@ class V2AgentTests(unittest.TestCase):
 
         self.assertGreaterEqual(client.max_rounds, 12)
 
+    def test_improve_mode_sends_focused_tool_catalog(self):
+        class ToolCaptureClient:
+            def __init__(self):
+                self.catalogs = []
+                self.efforts = []
+                self.reasoning_effort = "low"
+
+            def chat_with_tools(self, _messages, tools, _handler, **_kwargs):
+                self.catalogs.append({tool["function"]["name"] for tool in tools})
+                self.efforts.append(self.reasoning_effort)
+                return "没有需要修改的内容"
+
+        client = ToolCaptureClient()
+        agent = ProjectAgent(ProjectStore(QuestBookProject()), client)
+        agent.set_request_context({"intent": "improve", "strict": False})
+
+        agent.run("改进现有任务条件")
+
+        first, repair = client.catalogs
+        self.assertIn("add_task_condition", first)
+        self.assertIn("validate_project", first)
+        self.assertNotIn("create_reward_table", first)
+        self.assertLess(len(first), len(agent.tool_specs()))
+        self.assertEqual(len(repair), len(agent.tool_specs()))
+        self.assertEqual(client.efforts, ["low", "medium"])
+        self.assertEqual(client.reasoning_effort, "low")
+
     def test_basic_project_supports_cross_chapter_dependencies(self):
         store = ProjectStore(QuestBookProject())
         first = store.create_chapter("主线")
@@ -248,8 +292,15 @@ class V2AgentTests(unittest.TestCase):
     def test_agent_changes_project_only_through_tools(self):
         store = ProjectStore(QuestBookProject())
         toolbox = QuestToolbox({"create": {"create:mechanical_press": "Mechanical Press"}})
+        class SafeIndex:
+            @staticmethod
+            def agent_item_status(item_id):
+                return type("Status", (), {"allowed": True, "reasons": (), "item_id": item_id})()
         actions = []
-        agent = ProjectAgent(store, FakeToolClient(), toolbox, lambda name, *_: actions.append(name))
+        agent = ProjectAgent(
+            store, FakeToolClient(), toolbox, lambda name, *_: actions.append(name),
+            asset_index=SafeIndex(),
+        )
 
         reply = agent.run("创建机械动力任务")
 
@@ -263,6 +314,141 @@ class V2AgentTests(unittest.TestCase):
         ])
         self.assertTrue(agent.has_pending_changes)
         self.assertTrue(agent.commit_transaction())
+
+    def test_agent_search_hides_items_outside_safety_whitelist(self):
+        toolbox = QuestToolbox(
+            {"sample": {"sample:safe": "Safe", "sample:wip": "WIP"}},
+            availability={
+                "sample:safe": {"allowed": True, "status": "allowed"},
+                "sample:wip": {"allowed": False, "status": "blocked"},
+            },
+        )
+
+        self.assertEqual(
+            [value["item_id"] for value in toolbox.search_items("sample")],
+            ["sample:safe"],
+        )
+
+    def test_agent_write_rejects_guessed_item_even_without_search(self):
+        class SafetyIndex:
+            @staticmethod
+            def agent_item_status(item_id):
+                allowed = item_id == "sample:safe_gear"
+                return type("Status", (), {
+                    "allowed": allowed,
+                    "reasons": () if allowed else ("模型引用的贴图不存在",),
+                })()
+
+        store = ProjectStore(QuestBookProject())
+        chapter = store.create_chapter("安全测试")
+        agent = ProjectAgent(store, None, asset_index=SafetyIndex())
+
+        rejected = __import__("json").loads(agent.call_tool("add_quest", {
+            "chapter_id": chapter.id, "title": "坏物品", "task_type": "item",
+            "target": "sample:unfinished_core",
+        }))
+        accepted = __import__("json").loads(agent.call_tool("add_quest", {
+            "chapter_id": chapter.id, "title": "安全物品", "task_type": "item",
+            "target": "sample:safe_gear",
+        }))
+
+        self.assertIn("安全策略拒绝", rejected["error"])
+        self.assertEqual(accepted["title"], "安全物品")
+        self.assertIn("未先查询", accepted["warnings"][0]["message"])
+        self.assertEqual(len(store.chapter(chapter.id).quests), 1)
+
+    def test_agent_does_not_warn_after_item_was_returned_by_search(self):
+        class SafetyIndex:
+            @staticmethod
+            def agent_item_status(item_id):
+                return type("Status", (), {"allowed": True, "reasons": ()})()
+
+            @staticmethod
+            def registry_values(_registry):
+                return {}
+
+        availability = {"sample:safe": {"allowed": True, "status": "allowed"}}
+        toolbox = QuestToolbox(
+            {"sample": {"sample:safe": "Safe"}}, availability=availability,
+        )
+        store = ProjectStore(QuestBookProject())
+        chapter = store.create_chapter("查询测试")
+        actions = []
+        agent = ProjectAgent(
+            store, None, toolbox, lambda name, *_args: actions.append(name),
+            asset_index=SafetyIndex(),
+        )
+
+        searched = __import__("json").loads(agent.call_tool("search_items", {
+            "namespace": "sample", "query": "safe", "limit": 20,
+        }))
+        result = __import__("json").loads(agent.call_tool("add_quest", {
+            "chapter_id": chapter.id, "title": "已查询", "task_type": "item",
+            "target": "sample:safe",
+        }))
+
+        self.assertEqual(searched[0]["item_id"], "sample:safe")
+        self.assertNotIn("warnings", result)
+        self.assertNotIn("agent_id_unverified", actions)
+
+    def test_registry_id_guess_is_warned_if_real_and_rejected_if_missing(self):
+        class RegistryIndex:
+            @staticmethod
+            def agent_item_status(item_id):
+                return type("Status", (), {"allowed": True, "reasons": ()})()
+
+            @staticmethod
+            def registry_values(registry):
+                return {"sample:moon": "Moon"} if registry == "dimension" else {}
+
+        store = ProjectStore(QuestBookProject())
+        chapter = store.create_chapter("维度测试")
+        agent = ProjectAgent(store, None, asset_index=RegistryIndex())
+
+        guessed = __import__("json").loads(agent.call_tool("add_quest", {
+            "chapter_id": chapter.id, "title": "月球", "task_type": "dimension",
+            "target": "sample:moon",
+        }))
+        missing = __import__("json").loads(agent.call_tool("add_quest", {
+            "chapter_id": chapter.id, "title": "不存在", "task_type": "dimension",
+            "target": "sample:not_a_dimension",
+        }))
+
+        self.assertIn("未先查询", guessed["warnings"][0]["message"])
+        self.assertIn("注册表策略拒绝", missing["error"])
+        self.assertEqual(len(store.chapter(chapter.id).quests), 1)
+
+    def test_agent_safety_policy_covers_icons_rewards_and_copy(self):
+        class SafetyIndex:
+            @staticmethod
+            def agent_item_status(item_id):
+                allowed = item_id in {"minecraft:book", "sample:safe"}
+                return type("Status", (), {
+                    "allowed": allowed,
+                    "reasons": () if allowed else ("未发现游戏内使用证据",),
+                })()
+
+        store = FTBQuestStore.create_new(with_starter=False)
+        chapter = store.create_chapter("安全测试")
+        quest = store.add_quest(chapter.id, "旧任务", task_type="item", target="sample:legacy_bad")
+        agent = ProjectAgent(store, None, asset_index=SafetyIndex())
+
+        icon_result = __import__("json").loads(agent.call_tool("update_quest_fields", {
+            "quest_id": quest.id, "changes": {"icon": "sample:bad_icon"},
+        }))
+        reward_result = __import__("json").loads(agent.call_tool("add_quest_object", {
+            "quest_id": quest.id, "kind": "reward", "type_id": "item",
+            "values": {"item": {"id": "sample:bad_reward", "count": 1}},
+        }))
+        copy_result = __import__("json").loads(agent.call_tool("copy_quest", {
+            "quest_id": quest.id, "chapter_id": chapter.id, "x": 2, "y": 2,
+        }))
+        warnings = __import__("json").loads(agent.call_tool("validate_project", {}))
+
+        self.assertIn("安全策略拒绝", icon_result["error"])
+        self.assertIn("安全策略拒绝", reward_result["error"])
+        self.assertIn("安全策略拒绝", copy_result["error"])
+        self.assertTrue(any("sample:legacy_bad" in value["message"] for value in warnings))
 
     def test_plain_chat_client_uses_bounded_action_protocol(self):
         store = ProjectStore(QuestBookProject())

@@ -98,6 +98,21 @@ class FakeReasoningOnlyResponse:
         }
 
 
+class FakeLengthReasoningResponse:
+    status_code = 200
+
+    def json(self):
+        return {
+            "choices": [{
+                "message": {
+                    "content": None,
+                    "reasoning": "reasoning consumed the output budget",
+                },
+                "finish_reason": "length",
+            }],
+        }
+
+
 class FakeLegacyFunctionCallResponse:
     status_code = 200
 
@@ -113,6 +128,28 @@ class FakeLegacyFunctionCallResponse:
                     },
                 },
                 "finish_reason": "function_call",
+            }],
+        }
+
+
+class FakeTextToolCallResponse:
+    status_code = 200
+
+    def json(self):
+        return {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": (
+                        "<tool_call>\n"
+                        "<function=search_items>\n"
+                        "<parameter=query>gear</parameter>\n"
+                        "<parameter=limit>30</parameter>\n"
+                        "</function>\n"
+                        "</tool_call>"
+                    ),
+                },
+                "finish_reason": "stop",
             }],
         }
 
@@ -243,16 +280,20 @@ class AIClientTests(unittest.TestCase):
     def test_tool_loop_executes_handler_and_returns_final_content(self, post):
         client = GenericOpenAIClient("secret", "https://example.test/chat", "model")
         calls = []
+        trace = []
 
         content, truncated = client.chat_with_tools(
             [{"role": "user", "content": "generate"}],
             [{"type": "function", "function": {"name": "search_items", "parameters": {}}}],
             lambda name, arguments: calls.append((name, arguments)) or "[]",
+            trace_sink=trace,
         )
 
         self.assertEqual(content, "{}")
         self.assertFalse(truncated)
         self.assertEqual(calls[0][0], "search_items")
+        self.assertEqual(trace[0]["tool"], "search_items")
+        self.assertEqual(trace[0]["result"], [])
         second_messages = post.call_args_list[1].kwargs["json"]["messages"]
         self.assertEqual(second_messages[-1]["role"], "tool")
 
@@ -260,7 +301,7 @@ class AIClientTests(unittest.TestCase):
         "ai_clients.requests.post",
         side_effect=[FakeToolCallResponse(), FakeReasoningOnlyResponse(), FakeChatResponse()],
     )
-    def test_tool_loop_recovers_visible_answer_without_losing_tool_results(self, post):
+    def test_tool_loop_uses_local_summary_when_tools_succeeded_without_visible_text(self, post):
         client = GenericOpenAIClient("secret", "https://example.test/chat", "model")
 
         content, truncated = client.chat_with_tools(
@@ -269,11 +310,37 @@ class AIClientTests(unittest.TestCase):
             lambda *_: "[]",
         )
 
-        self.assertEqual((content, truncated), ("{}", False))
-        recovery_messages = post.call_args_list[2].kwargs["json"]["messages"]
-        self.assertTrue(any(message.get("role") == "tool" for message in recovery_messages))
-        self.assertIn("visible final answer", recovery_messages[-1]["content"])
+        self.assertIn("工具操作已完成", content)
+        self.assertFalse(truncated)
+        self.assertEqual(post.call_count, 2)
         self.assertTrue(client._tool_support)
+
+    @patch(
+        "ai_clients.requests.post",
+        side_effect=[FakeToolCallResponse(), FakeLengthReasoningResponse()],
+    )
+    def test_tool_loop_reports_output_budget_exhaustion_after_queries(self, post):
+        client = GenericOpenAIClient("secret", "https://example.test/chat", "model")
+
+        content, truncated = client.chat_with_tools(
+            [{"role": "user", "content": "generate"}],
+            [{"type": "function", "function": {"name": "search_items", "parameters": {}}}],
+            lambda *_: "[]",
+        )
+
+        self.assertTrue(truncated)
+        self.assertIn("输出预算", content)
+        self.assertEqual(post.call_count, 2)
+
+    @patch("ai_clients.requests.post", return_value=FakeChatResponse())
+    def test_low_reasoning_effort_is_sent_to_compatible_provider(self, post):
+        client = GenericOpenAIClient(
+            "secret", "https://example.test/chat", "model", reasoning_effort="low",
+        )
+
+        client.chat([{"role": "user", "content": "test"}])
+
+        self.assertEqual(post.call_args.kwargs["json"]["reasoning"], {"effort": "low"})
 
     @patch("ai_clients.requests.post", side_effect=[FakeLegacyFunctionCallResponse(), FakeChatResponse()])
     def test_tool_loop_supports_legacy_function_call_shape(self, post):
@@ -291,6 +358,42 @@ class AIClientTests(unittest.TestCase):
         assistant = post.call_args_list[1].kwargs["json"]["messages"][1]
         self.assertIn("tool_calls", assistant)
         self.assertNotIn("function_call", assistant)
+
+    @patch("ai_clients.requests.post", side_effect=[FakeTextToolCallResponse(), FakeChatResponse()])
+    def test_tool_loop_normalizes_mimo_xml_tool_call(self, post):
+        client = GenericOpenAIClient("secret", "https://example.test/chat", "model")
+        calls = []
+
+        content, _ = client.chat_with_tools(
+            [{"role": "user", "content": "search"}],
+            [{"type": "function", "function": {"name": "search_items", "parameters": {}}}],
+            lambda name, arguments: calls.append((name, arguments)) or "[]",
+        )
+
+        self.assertEqual(content, "{}")
+        self.assertEqual(calls, [("search_items", {"query": "gear", "limit": 30})])
+        assistant = post.call_args_list[1].kwargs["json"]["messages"][1]
+        self.assertEqual(assistant["content"], "")
+        self.assertEqual(assistant["tool_calls"][0]["function"]["name"], "search_items")
+
+    @patch(
+        "ai_clients.requests.post",
+        side_effect=[FakeToolCallResponse(), FakeTextToolCallResponse(), FakeChatResponse()],
+    )
+    def test_final_synthesis_executes_textual_tool_call_instead_of_exposing_markup(self, post):
+        client = GenericOpenAIClient("secret", "https://example.test/chat", "model")
+        calls = []
+
+        content, _ = client.chat_with_tools(
+            [{"role": "user", "content": "search"}],
+            [{"type": "function", "function": {"name": "search_items", "parameters": {}}}],
+            lambda name, arguments: calls.append((name, arguments)) or "[]",
+            max_rounds=1,
+        )
+
+        self.assertEqual(content, "{}")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("<tool_call", content)
 
     @patch("ai_clients.requests.post", side_effect=[FakeManyToolCallsResponse(), FakeChatResponse()])
     def test_tool_loop_keeps_bounded_calls_and_results_in_sync(self, post):

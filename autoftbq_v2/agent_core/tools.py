@@ -30,9 +30,13 @@ class AgentToolRegistry:
     def is_write(self, name: str) -> bool:
         return self.contains(name) and not self.is_read_only(name)
 
-    def specs(self) -> list[dict]:
+    def specs(self, names=None) -> list[dict]:
         # Model clients may normalize schemas in place, so callers get a copy.
-        return deepcopy(self._specs)
+        allowed = None if names is None else {str(name) for name in names}
+        return deepcopy([
+            spec for spec in self._specs
+            if allowed is None or spec["function"]["name"] in allowed
+        ])
 
-    def function_specs(self) -> list[dict]:
-        return [deepcopy(spec["function"]) for spec in self._specs]
+    def function_specs(self, names=None) -> list[dict]:
+        return [deepcopy(spec["function"]) for spec in self.specs(names)]

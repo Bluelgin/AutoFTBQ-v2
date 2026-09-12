@@ -48,6 +48,17 @@ class V2AISetupTests(unittest.TestCase):
         self.assertEqual(client.api_url, "http://localhost:1234/v1/chat/completions")
         self.assertEqual(client.model, "custom-model")
 
+    def test_openrouter_custom_config_defaults_to_low_reasoning(self):
+        client = client_from_config({
+            "engine": "generic",
+            "provider": "第三方自定义",
+            "api_key": "secret",
+            "api_url": "https://openrouter.ai/api/v1/chat/completions",
+            "api_model": "fast-model",
+        })
+
+        self.assertEqual(client.reasoning_effort, "low")
+
     def test_atomic_save_preserves_non_ai_settings(self):
         with tempfile.TemporaryDirectory() as root:
             path = os.path.join(root, "config.json")

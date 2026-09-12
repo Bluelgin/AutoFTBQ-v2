@@ -11,12 +11,12 @@ python -m PyInstaller --clean AutoFTBQ-v2.spec
 if errorlevel 1 goto :error
 
 echo.
-echo 打包完成：dist\AutoFTBQ-v2.exe
+echo 打包完成：dist\AutoFTBQ-Studio\AutoFTBQ-Studio.exe
 pause
 exit /b 0
 
 :error
 echo.
-echo v2 打包失败，请查看上方信息。
+echo AutoFTBQ Studio 打包失败，请查看上方信息。
 pause
 exit /b 1

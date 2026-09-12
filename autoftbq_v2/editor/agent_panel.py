@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtGui import QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -28,6 +28,8 @@ class AgentPanel(QFrame):
     setup_requested = Signal()
     clear_context_requested = Signal()
     command_selected = Signal(str)
+    open_game_book_requested = Signal()
+    sync_game_book_requested = Signal()
 
     def __init__(self, commands, parent=None):
         super().__init__(parent)
@@ -57,6 +59,22 @@ class AgentPanel(QFrame):
         self.model_label.setWordWrap(True)
         layout.addWidget(self.model_label)
 
+        self.game_bridge_label = QLabel("游戏连接：等待 AutoFTBQ Agent Mod")
+        self.game_bridge_label.setObjectName("agentMuted")
+        self.game_bridge_label.setWordWrap(True)
+        layout.addWidget(self.game_bridge_label)
+
+        game_book_row = QHBoxLayout()
+        self.open_game_book_button = QPushButton("在工作台编辑游戏任务书")
+        self.open_game_book_button.setEnabled(False)
+        self.open_game_book_button.clicked.connect(self.open_game_book_requested)
+        self.sync_game_book_button = QPushButton("同步到游戏")
+        self.sync_game_book_button.setEnabled(False)
+        self.sync_game_book_button.clicked.connect(self.sync_game_book_requested)
+        game_book_row.addWidget(self.open_game_book_button, 1)
+        game_book_row.addWidget(self.sync_game_book_button)
+        layout.addLayout(game_book_row)
+
         self.chat = QTextBrowser()
         self.chat.setObjectName("chat")
         self.chat.setOpenExternalLinks(True)
@@ -71,9 +89,7 @@ class AgentPanel(QFrame):
         layout.addWidget(self.agent_goal_label)
         self.agent_progress_bar = QProgressBar()
         self.agent_progress_bar.setObjectName("agentProgress")
-        self.agent_progress_bar.setRange(0, 3)
-        self.agent_progress_bar.setValue(0)
-        self.agent_progress_bar.setFormat("尚未开始")
+        self.set_progress_idle()
         layout.addWidget(self.agent_progress_bar)
         self.agent_current_label = QLabel("当前：等待开始")
         self.agent_current_label.setObjectName("agentCurrent")
@@ -160,13 +176,14 @@ class AgentPanel(QFrame):
         self.action_list.setVisible(bool(visible))
         self.action_toggle_button.setText("收起详情" if visible else "技术详情")
 
-    def _progress_item(self, text: str, tooltip: str = "") -> None:
+    def _progress_item(self, text: str, tooltip: str = "") -> QListWidgetItem:
         item = QListWidgetItem(str(text))
         item.setToolTip(tooltip or str(text))
         self.agent_progress_list.addItem(item)
         self.agent_progress_list.scrollToBottom()
         while self.agent_progress_list.count() > 30:
             self.agent_progress_list.takeItem(0)
+        return item
 
     def update_progress(self, name: str, detail: str) -> None:
         try:
@@ -213,6 +230,12 @@ class AgentPanel(QFrame):
             self._progress_item(f"待修复 · {error}", detail)
             self.agent_progress_bar.setFormat("步骤 2/3 · 修正当前操作")
             self.agent_current_label.setText("当前：修改被安全拒绝，等待 Agent 修正参数")
+        elif name == "agent_id_unverified":
+            ids = value.get("ids", []) if isinstance(value, dict) else []
+            labels = [str(entry.get("id", "")) for entry in ids if isinstance(entry, dict)]
+            text = "、".join(value for value in labels if value) or "未知 ID"
+            item = self._progress_item(f"提醒 · 未查询直接使用：{text}", detail)
+            item.setForeground(QColor("#8a6400"))
         elif name == "agent_checkpoint_rollback":
             removed = str(value.get("removed") or "上一步") if isinstance(value, dict) else "上一步"
             self._progress_item(f"已撤销 · {removed}", detail)
@@ -236,20 +259,19 @@ class AgentPanel(QFrame):
             self.agent_progress_bar.setRange(0, 0)
             self.agent_progress_bar.setFormat("正在执行修改")
         elif name == "agent_commit":
-            self.agent_progress_bar.setRange(0, 3)
-            self.agent_progress_bar.setValue(3)
-            self.agent_progress_bar.setFormat("已保留本轮成果")
-            self.agent_current_label.setText("当前：等待下一条要求")
+            self.set_progress_idle()
         elif name == "agent_rollback":
-            self.agent_progress_bar.setRange(0, 3)
-            self.agent_progress_bar.setValue(0)
-            self.agent_progress_bar.setFormat("已撤销本轮修改")
+            self.set_progress_idle()
+
+    def set_progress_idle(self) -> None:
+        """Show an empty determinate bar whenever no Agent request is active."""
+        self.agent_progress_bar.setRange(0, 100)
+        self.agent_progress_bar.setValue(0)
+        self.agent_progress_bar.setFormat("")
+        if hasattr(self, "agent_current_label"):
             self.agent_current_label.setText("当前：等待下一条要求")
 
     def reset_progress(self) -> None:
         self.agent_progress_list.clear()
         self.agent_goal_label.setText("等待你的要求")
-        self.agent_progress_bar.setRange(0, 3)
-        self.agent_progress_bar.setValue(0)
-        self.agent_progress_bar.setFormat("尚未开始")
-        self.agent_current_label.setText("当前：等待开始")
+        self.set_progress_idle()

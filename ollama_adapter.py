@@ -75,11 +75,25 @@ class OllamaClient:
         """
         system_prompt = ""
         user_prompt = ""
+        images = []
         for msg in messages:
             if msg["role"] == "system":
                 system_prompt = msg["content"]
             elif msg["role"] == "user":
-                user_prompt = msg["content"]
+                content = msg["content"]
+                if isinstance(content, list):
+                    text_parts = []
+                    for part in content:
+                        if part.get("type") == "text":
+                            text_parts.append(part.get("text", ""))
+                        elif part.get("type") == "image_url":
+                            url = part.get("image_url", {}).get("url", "")
+                            if not url.startswith("data:image/png;base64,"):
+                                raise ValueError("Ollama 画板只支持内嵌 PNG 图片")
+                            images.append(url.split(",", 1)[1])
+                    user_prompt = "\n".join(text_parts)
+                else:
+                    user_prompt = content
 
         payload = {
             "model": self.model,
@@ -91,6 +105,9 @@ class OllamaClient:
                 "num_predict": max_tokens,
             }
         }
+
+        if images:
+            payload["images"] = list(dict.fromkeys(images))
 
         try:
             resp = requests.post(

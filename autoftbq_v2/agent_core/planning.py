@@ -24,12 +24,12 @@ def _metrics(store) -> dict:
 
 def _requested_quest_count(text: str) -> int:
     matches = re.findall(
-        r"(?:共|至少|创建|添加|生成|制作|安排)?\s*(\d{1,3})\s*(?:个|项|条|道)?"
+        r"(?:共|至少|创建|添加|生成|制作|安排)?\s*(\d{1,5})\s*(?:个|项|条|道)?"
         r"\s*[^，。；,\n]{0,10}?(?:任务|节点)",
         text,
     )
     if matches:
-        return max(1, min(int(matches[-1]), 100))
+        return max(1, int(matches[-1]))
     for word, value in sorted(_CHINESE_NUMBERS.items(), key=lambda item: -len(item[0])):
         if re.search(rf"{word}\s*(?:个|项|条|道)?\s*(?:任务|节点)", text):
             return value
@@ -38,6 +38,28 @@ def _requested_quest_count(text: str) -> int:
     if "完整" in text and any(word in text for word in ("主线", "流程", "入门", "进阶", "精通")):
         return 4
     return 0
+
+
+def _request_signals(request: str) -> tuple[str, str]:
+    """Return the actual user instruction and structured composer mode."""
+    text = str(request or "").strip()
+    if not text.startswith("[AutoFTBQ 结构化请求]"):
+        return text, ""
+    mode_match = re.search(r"^执行模式：([^\n]+)", text, re.MULTILINE)
+    instruction_match = re.search(r"^用户要求：([^\n]+)", text, re.MULTILINE)
+    return (
+        instruction_match.group(1).strip() if instruction_match else text,
+        mode_match.group(1).strip() if mode_match else "",
+    )
+
+
+def _explicit_creation(text: str, object_words: tuple[str, ...]) -> bool:
+    verbs = r"(?:创建|添加|生成|新建|建议|设计|编写|制作|安排)"
+    objects = "(?:" + "|".join(map(re.escape, object_words)) + ")"
+    return bool(
+        re.search(rf"{verbs}[^，。；,\n]{{0,12}}{objects}", text)
+        or re.search(rf"{objects}[^，。；,\n]{{0,8}}{verbs}", text)
+    )
 
 
 @dataclass
@@ -157,20 +179,22 @@ class AgentRunPlan:
 
 def build_run_plan(request: str, store) -> AgentRunPlan:
     text = str(request or "").strip()
+    instruction, structured_mode = _request_signals(text)
     baseline = _metrics(store)
-    mutation_intent = any(word in text for word in (
+    mutation_intent = any(word in instruction for word in (
         "创建", "添加", "生成", "制作", "修改", "完善", "删除", "移动", "连线", "连接", "修复", "排列",
         "建议", "设计", "编写", "改进", "优化", "补全", "重排", "布局", "润色",
-    ))
-    creates_quests = any(word in text for word in (
-        "创建", "添加", "生成", "制作", "安排", "新建", "建议", "设计", "编写",
-    ))
-    quest_count = _requested_quest_count(text) if creates_quests else 0
-    wants_chapter = "章节" in text and any(word in text for word in (
-        "创建", "添加", "生成", "制作", "新建", "建议", "设计", "编写",
-    ))
-    rejects_links = any(word in text for word in ("不要连线", "无需连线", "不需要连线", "独立任务"))
-    wants_links = not rejects_links and any(word in text for word in (
+    )) or structured_mode in {"生成", "改进", "补全", "重排", "连线", "润色"}
+    creates_quests = _explicit_creation(instruction, ("任务", "节点", "主线", "支线", "流程"))
+    wants_chapter = _explicit_creation(instruction, ("章节", "章"))
+    if structured_mode == "生成":
+        creates_quests = creates_quests or any(word in instruction for word in ("任务", "节点", "主线", "支线", "流程", "玩法"))
+        wants_chapter = wants_chapter or any(word in instruction for word in ("章节", "章"))
+    if wants_chapter and "全部" in instruction and "玩法" in instruction:
+        creates_quests = True
+    quest_count = _requested_quest_count(instruction) if creates_quests else 0
+    rejects_links = any(word in instruction for word in ("不要连线", "无需连线", "不需要连线", "独立任务"))
+    wants_links = not rejects_links and any(word in instruction for word in (
         "主线", "流程", "连线", "连接", "前置", "依赖", "入门到", "进阶", "精通", "分支", "汇合",
     ))
     criteria = []
@@ -188,7 +212,7 @@ def build_run_plan(request: str, store) -> AgentRunPlan:
             ("item", "物品", ("物品任务", "提交物品", "检测物品")),
             ("advancement", "进度", ("进度任务", "游戏进度", "成就任务")),
         )
-        if any(word in text for word in words)
+        if creates_quests and any(word in instruction for word in words)
     ]
     for type_id, label in type_mentions:
         target = quest_count if quest_count and len(type_mentions) == 1 else 1
@@ -198,11 +222,11 @@ def build_run_plan(request: str, store) -> AgentRunPlan:
     if wants_links:
         edge_target = max(1, quest_count - 1) if quest_count else 1
         criteria.append(AcceptanceCriterion("dependencies_added", f"建立至少 {edge_target} 条有效前置关系", edge_target))
-    row_match = re.search(r"(?:每行|每层)\s*(\d{1,2})", text)
+    row_match = re.search(r"(?:每行|每层)\s*(\d{1,2})", instruction)
     if row_match is None:
-        row_match = re.search(r"(\d{1,2})\s*(?:个任务|个)?后.{0,8}(?:下一层|下一行|换行)", text)
+        row_match = re.search(r"(\d{1,2})\s*(?:个任务|个)?后.{0,8}(?:下一层|下一行|换行)", instruction)
     row_width = int(row_match.group(1)) if row_match else 0
-    if not row_width and quest_count > 5 and any(word in text for word in ("不要横向", "下一层", "下一行", "换行")):
+    if not row_width and quest_count > 5 and any(word in instruction for word in ("不要横向", "下一层", "下一行", "换行")):
         row_width = 5
     if row_width and quest_count > row_width:
         criteria.append(AcceptanceCriterion(

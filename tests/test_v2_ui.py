@@ -1,13 +1,14 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QPalette
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QComboBox, QScrollArea, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QComboBox, QLabel, QScrollArea, QVBoxLayout, QWidget
 
 from autoftbq_v2.infrastructure.asset_index import ItemAsset
 from autoftbq_v2.ftb.schema import REWARD_TYPES, TASK_TYPES
@@ -17,6 +18,7 @@ from autoftbq_v2.ui import (
     CurvedDependencyLine,
     DependencyLine,
     FormWheelNavigationFilter,
+    IconPickerDialog,
     ItemPickerDialog,
     MainWindow,
     ModpackScanThread,
@@ -47,6 +49,33 @@ class FakeAssetIndex:
 
 
 class V2UiTests(unittest.TestCase):
+    def test_game_backend_locks_desktop_and_preserves_draft_on_disconnect(self):
+        window = MainWindow(restore_workspace=False)
+        self.addCleanup(window.close)
+        original = window.store
+        service = Mock()
+        service.snapshot.return_value = {
+            "available": True, "project_id": "world-a", "session_id": "session-a",
+            "conversation_id": "chat-a", "seconds_since_sync": 0,
+            "server_can_edit": True,
+        }
+        service.events.return_value = []
+        window.bridge_server = Mock(service=service)
+        with patch.object(window, "_process_game_agent_requests"):
+            window._refresh_game_bridge_status()
+            self.assertTrue(window._game_backend_mode)
+            self.assertFalse(window.desktop_workspace.isEnabled())
+            self.assertEqual(window.workspace_modes.currentIndex(), 1)
+            window.new_project()
+            window.open_live_game_book()
+            window.sync_live_game_book()
+            self.assertIs(window.store, original)
+            service.queue_studio_book.assert_not_called()
+            service.snapshot.return_value = {"available": False}
+            window._refresh_game_bridge_status()
+            self.assertIn("中断", window.backend_status.text())
+            self.assertFalse(window.desktop_workspace.isEnabled())
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -59,6 +88,154 @@ class V2UiTests(unittest.TestCase):
         self.assertEqual(palette.color(QPalette.ColorRole.WindowText).name(), "#202722")
         self.assertEqual(palette.color(QPalette.ColorRole.Base).name(), "#fffefb")
         self.assertEqual(palette.color(QPalette.ColorRole.Text).name(), "#202722")
+
+    def test_window_uses_studio_product_name(self):
+        window = MainWindow(restore_workspace=False)
+        window.show()
+        self.app.processEvents()
+        self.assertEqual(window.windowTitle(), "AutoFTBQ Studio")
+        brand = window.findChild(QLabel, "brandName")
+        self.assertIsNotNone(brand)
+        self.assertEqual(brand.text().replace("\n", " "), "AutoFTBQ Studio")
+        widest_line = max(brand.fontMetrics().horizontalAdvance(line) for line in brand.text().splitlines())
+        self.assertGreaterEqual(brand.width(), widest_line)
+        window.close()
+
+    def test_agent_progress_is_empty_when_no_request_is_active(self):
+        window = MainWindow(restore_workspace=False)
+
+        self.assertEqual(window.agent_progress_bar.minimum(), 0)
+        self.assertEqual(window.agent_progress_bar.maximum(), 100)
+        self.assertEqual(window.agent_progress_bar.value(), 0)
+        self.assertEqual(window.agent_progress_bar.format(), "")
+
+        window.update_agent_progress("agent_plan", '{"request":"测试任务"}')
+        window.update_agent_progress("agent_commit", "{}")
+        self.assertEqual(window.agent_progress_bar.maximum(), 100)
+        self.assertEqual(window.agent_progress_bar.value(), 0)
+        self.assertEqual(window.agent_progress_bar.format(), "")
+        self.assertEqual(window.agent_current_label.text(), "当前：等待下一条要求")
+        window.close()
+
+    def test_agent_finish_clears_stale_progress_and_keeps_only_interruption_message(self):
+        window = MainWindow(restore_workspace=False)
+        window.agent_progress_bar.setRange(0, 3)
+        window.agent_progress_bar.setValue(2)
+        window.agent_current_label.setText("当前：等待下一条要求")
+
+        window.agent_finished()
+        self.assertEqual(window.agent_progress_bar.maximum(), 100)
+        self.assertEqual(window.agent_progress_bar.value(), 0)
+
+        window.agent_progress_bar.setRange(0, 3)
+        window.agent_progress_bar.setValue(2)
+        window._agent_attention_message = "当前：检查点已保留，可发送“继续”恢复执行"
+        window.agent_finished()
+        self.assertEqual(window.agent_progress_bar.maximum(), 100)
+        self.assertEqual(window.agent_progress_bar.value(), 0)
+        self.assertEqual(window.agent_progress_bar.format(), "")
+        self.assertIn("继续", window.agent_current_label.text())
+        window.close()
+
+    def test_workspace_restore_does_not_replay_historical_progress(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = MainWindow(workspace_dir=root)
+            first._workspace_enabled = True
+            first._workspace_ready = True
+            first.append_action("agent_plan", '{"request":"历史任务"}', refresh=False)
+            first.append_action("agent_repair", "{}", refresh=False)
+            first._save_workspace_snapshot()
+            first.close()
+
+            restored = MainWindow(restore_workspace=True, workspace_dir=root)
+
+            self.assertTrue(any(row["name"] == "agent_repair" for row in restored.action_records))
+            self.assertGreater(restored.action_list.count(), 0)
+            self.assertEqual(restored.agent_progress_bar.minimum(), 0)
+            self.assertEqual(restored.agent_progress_bar.maximum(), 100)
+            self.assertEqual(restored.agent_progress_bar.value(), 0)
+            self.assertEqual(restored.agent_progress_bar.format(), "")
+            self.assertEqual(restored.agent_current_label.text(), "当前：等待下一条要求")
+            restored.close()
+
+    def test_canvas_uses_nonblocking_cached_icon_lookup(self):
+        class NonBlockingIndex:
+            def __init__(self):
+                self.cached_calls = 0
+
+            def cached_icon_for(self, _item_id):
+                self.cached_calls += 1
+                return ""
+
+            def cached_image_for(self, _image_id):
+                return ""
+
+            def icon_for(self, _item_id):
+                raise AssertionError("chapter switching must not render icons synchronously")
+
+        window = MainWindow(restore_workspace=False)
+        index = NonBlockingIndex()
+        window.asset_index = index
+
+        window.refresh_canvas()
+
+        self.assertGreater(index.cached_calls, 0)
+        window.close()
+
+    def test_canvas_expands_when_view_approaches_right_edge(self):
+        window = MainWindow(restore_workspace=False)
+        window.show()
+        self.app.processEvents()
+        before = window.scene.sceneRect()
+
+        window.canvas.centerOn(before.right(), before.center().y())
+        window.canvas.ensure_scene_space()
+        after = window.scene.sceneRect()
+
+        self.assertGreater(after.right(), before.right())
+        self.assertEqual(after.left(), before.left())
+        window.close()
+
+    def test_canvas_refresh_does_not_shrink_explored_area_in_same_chapter(self):
+        window = MainWindow(restore_workspace=False)
+        expanded = window.scene.sceneRect().adjusted(-4000, -3000, 5000, 3000)
+        window.scene.setSceneRect(expanded)
+
+        window.refresh_canvas()
+
+        refreshed = window.scene.sceneRect()
+        self.assertLessEqual(refreshed.left(), expanded.left())
+        self.assertGreaterEqual(refreshed.right(), expanded.right())
+        window.close()
+
+    def test_fit_canvas_uses_content_instead_of_expanded_scene(self):
+        window = MainWindow(restore_workspace=False)
+        window.show()
+        self.app.processEvents()
+        window.scene.setSceneRect(-100000, -100000, 200000, 200000)
+
+        window.fit_canvas()
+
+        content = window.scene.itemsBoundingRect()
+        visible = window.canvas.viewport_scene_rect()
+        self.assertTrue(visible.contains(content))
+        self.assertGreater(window.canvas.transform().m11(), 0.1)
+        window.close()
+
+    def test_workspace_snapshot_records_scene_center(self):
+        with tempfile.TemporaryDirectory() as root:
+            window = MainWindow(workspace_dir=root)
+            window._workspace_enabled = True
+            window._workspace_ready = True
+            window.canvas.centerOn(1840.0, -620.0)
+            self.app.processEvents()
+
+            window._save_workspace_snapshot()
+
+            loaded = window.workspace_repository.load()
+            self.assertIn("center_x", loaded.session["view"])
+            self.assertIn("center_y", loaded.session["view"])
+            window.close()
 
     def test_combo_wheel_scrolls_form_without_changing_selection(self):
         class WheelEvent:
@@ -131,6 +308,9 @@ class V2UiTests(unittest.TestCase):
             self.assertTrue(any(value["name"] == "update_quest" for value in restored.action_records))
             self.assertEqual(restored._restored_agent_history[-1]["content"], "上一轮结果")
             self.assertEqual(restored._restored_agent_run_state["request"], "创建主线")
+            self.assertEqual(restored.agent_progress_bar.value(), 0)
+            self.assertEqual(restored.agent_progress_bar.format(), "")
+            self.assertIn("继续", restored.agent_current_label.text())
             self.assertEqual(restored.agent_context_quest_ids, {quest.id})
             self.assertEqual(restored._restored_agent_request_context["intent"], "improve")
             restored.close()
@@ -217,6 +397,21 @@ class V2UiTests(unittest.TestCase):
         self.assertIn("验收通过", window.agent_progress_bar.format())
         window.close()
 
+    def test_agent_progress_marks_unqueried_but_safe_id_as_warning(self):
+        window = MainWindow()
+
+        window.update_agent_progress(
+            "agent_id_unverified",
+            '{"message":"使用了真实且安全、但本轮未先查询的 ID",'
+            '"ids":[{"registry":"item","id":"create:shaft"}]}',
+        )
+
+        item = window.agent_progress_list.item(window.agent_progress_list.count() - 1)
+        self.assertIn("提醒", item.text())
+        self.assertIn("create:shaft", item.text())
+        self.assertEqual(item.foreground().color().name(), "#8a6400")
+        window.close()
+
     def test_ui_can_undo_only_the_latest_agent_checkpoint(self):
         window = MainWindow()
         agent = __import__("autoftbq_v2.agent", fromlist=["ProjectAgent"]).ProjectAgent(
@@ -254,6 +449,10 @@ class V2UiTests(unittest.TestCase):
         self.assertIsNotNone(window.store.chapter(chapter_id))
         self.assertTrue(agent.has_pending_changes)
         self.assertIn("安全检查点", window.chat.toPlainText())
+        self.assertEqual(window.agent_progress_bar.maximum(), 100)
+        self.assertEqual(window.agent_progress_bar.value(), 0)
+        self.assertEqual(window.agent_progress_bar.format(), "")
+        self.assertIn("继续", window.agent_current_label.text())
         window.close()
 
     def test_slash_menu_sets_command_and_mode(self):
@@ -764,6 +963,40 @@ class V2UiTests(unittest.TestCase):
 
         self.assertEqual(picker.selected_id, "create:shaft")
         picker.close()
+
+    def test_icon_picker_searches_grid_and_returns_selection(self):
+        class CachedIndex(FakeAssetIndex):
+            def cached_icon_for(self, _item_id):
+                return ""
+
+            def icon_status_text(self, _item_id):
+                return ""
+
+        picker = IconPickerDialog(CachedIndex())
+        picker.search.setText("create")
+
+        self.assertEqual(picker.results.count(), 2)
+        picker.results.setCurrentRow(1)
+        expected = picker.results.currentItem().data(Qt.ItemDataRole.UserRole)
+        picker.accept_selection()
+
+        self.assertEqual(picker.selected_id, expected)
+        picker.close()
+
+    def test_quest_icon_shortcuts_use_target_and_clear_override(self):
+        window = MainWindow()
+        quest = window.store.chapter(window.current_chapter_id).quests[0]
+        window.current_quest_id = quest.id
+        window.load_inspector(quest)
+        window.quest_type.setCurrentIndex(window.quest_type.findData("item"))
+        window.quest_target.setText("minecraft:iron_ingot")
+
+        window.use_target_as_quest_icon()
+        self.assertEqual(window.quest_icon.text(), "minecraft:iron_ingot")
+        window.clear_quest_icon()
+        self.assertEqual(window.quest_icon.text(), "")
+        self.assertEqual(window.quest_icon_preview.text(), "自动")
+        window.close()
 
     def test_generic_registry_picker_searches_readable_names_and_ids(self):
         picker = RegistryPickerDialog("选择群系", {

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from ..infrastructure.asset_index import AssetIndex
 from ..ftb.schema import object_spec, schema_catalog
+from .item_policy import AgentItemPolicy
 
 
 @dataclass(frozen=True)
@@ -133,4 +134,7 @@ class AgentQueryTools:
         return self.toolbox.get_recipe(arguments.get("item_id", ""), arguments.get("depth", 1))
 
     def _handle_validate_project(self, _arguments: dict):
-        return self.store.validate(self.toolbox.all_items)
+        issues = list(self.store.validate(self.toolbox.all_items))
+        if self.asset_index is not None:
+            issues.extend(AgentItemPolicy(self.store, self.asset_index).existing_warnings())
+        return issues
