@@ -1,0 +1,37 @@
+name: Game Mod
+
+on:
+  push:
+    paths:
+      - "game-mod/**"
+      - ".github/workflows/game-mod.yml"
+  pull_request:
+    paths:
+      - "game-mod/**"
+      - ".github/workflows/game-mod.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+          cache-dependency-path: game-mod/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Build and run game-mod smoke tests
+        shell: pwsh
+        run: |
+          Set-Location game-mod
+          .\gradlew.bat build strictSnbtSmoke questIndexSmoke sketchSmoke --no-daemon

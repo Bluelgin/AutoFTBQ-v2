@@ -97,7 +97,6 @@ public abstract class QuestScreenAgentMixin implements QuestScreenAgentHost {
 
     @Override
     public void autoftbq$toggleAgentDock() {
-        if (!ClientQuestFile.INSTANCE.canEdit() && !AgentDockState.isOpen()) return;
         boolean opened = AgentDockState.toggle();
         autoftbq$layoutAgent();
         if (opened) BridgeClient.INSTANCE.connectAndSync();

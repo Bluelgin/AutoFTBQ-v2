@@ -40,10 +40,12 @@ public final class AutoFTBQForgeClient {
         public static void recipesChanged(net.minecraftforge.client.event.RecipesUpdatedEvent event) {
             dev.autoftbq.agent.compat.ftbq.v2001.GameDataCatalog.invalidate();
         }
+
         @SubscribeEvent
         public static void tagsChanged(net.minecraftforge.event.TagsUpdatedEvent event) {
             dev.autoftbq.agent.compat.ftbq.v2001.GameDataCatalog.invalidate();
         }
+
         @SubscribeEvent
         public static void clientTick(TickEvent.ClientTickEvent event) {
             if (event.phase == TickEvent.Phase.END) {
@@ -53,13 +55,13 @@ public final class AutoFTBQForgeClient {
                 Minecraft minecraft = Minecraft.getInstance();
                 if (minecraft.screen instanceof QuestScreenAgentHost host) {
                     host.autoftbq$toggleAgentDock();
-                } else if (ClientQuestFile.exists() && ClientQuestFile.INSTANCE.canEdit()) {
+                } else if (ClientQuestFile.exists()) {
                     QuestScreen screen = ClientQuestFile.openGui();
                     minecraft.execute(() -> ((QuestScreenAgentHost) screen)
                             .autoftbq$toggleAgentDock());
                 } else if (minecraft.player != null) {
                     minecraft.player.displayClientMessage(Component.translatable(
-                            "screen.autoftbq_agent.edit_mode_required"), true);
+                            "screen.autoftbq_agent.ftbq_required"), true);
                 }
             }
         }
