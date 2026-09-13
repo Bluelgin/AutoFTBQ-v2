@@ -9,10 +9,8 @@ import dev.ftb.mods.ftblibrary.ui.TextBox;
 import dev.ftb.mods.ftblibrary.ui.Theme;
 import dev.ftb.mods.ftblibrary.ui.Widget;
 import dev.ftb.mods.ftblibrary.ui.input.MouseButton;
-import dev.ftb.mods.ftbquests.client.gui.quests.QuestScreen;
 import dev.ftb.mods.ftbquests.client.ClientQuestFile;
-import dev.ftb.mods.ftbquests.quest.Chapter;
-import dev.ftb.mods.ftbquests.quest.Quest;
+import dev.ftb.mods.ftbquests.client.gui.quests.QuestScreen;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphics;
@@ -31,6 +29,7 @@ public final class FTBQ2001AgentDockPanel extends Panel {
     private TextBox prompt;
     private TranscriptWidget transcript;
     private final List<DockButton> actionButtons = new ArrayList<>();
+    private boolean extraActionsVisible;
     private String selectionKey = "";
     private int syncDelay = 1;
     private int studioTransactionPollDelay = 20;
@@ -66,37 +65,55 @@ public final class FTBQ2001AgentDockPanel extends Panel {
             }
         };
         prompt.setMaxLength(8000);
-        prompt.ghostText = Component.translatable("screen.autoftbq_agent.prompt_hint").getString();
+        refreshPromptHint();
         add(prompt);
 
         actionButtons.clear();
-        actionButtons.add(addAction("screen.autoftbq_agent.sketch",
-                () -> !BridgeClient.INSTANCE.isBusy(),
-                () -> Minecraft.getInstance().setScreen(new dev.autoftbq.agent.client.LayoutSketchScreen(Minecraft.getInstance().screen))));
         actionButtons.add(addAction("screen.autoftbq_agent.submit_short",
-                () -> canEditNow() && !BridgeClient.INSTANCE.isBusy() && !prompt.getText().trim().isEmpty(),
-                this::submitPrompt));
+                () -> canEditNow() && !BridgeClient.INSTANCE.isBusy()
+                        && !prompt.getText().trim().isEmpty(),
+                () -> !BridgeClient.INSTANCE.isBusy(), this::submitPrompt));
         actionButtons.add(addAction("screen.autoftbq_agent.cancel",
+                BridgeClient.INSTANCE::isBusy,
                 BridgeClient.INSTANCE::isBusy, BridgeClient.INSTANCE::cancelRequest));
         actionButtons.add(addAction("screen.autoftbq_agent.pause_resume",
-                BridgeClient.INSTANCE::canPauseRequest, BridgeClient.INSTANCE::togglePauseRequest));
-        actionButtons.add(addAction("screen.autoftbq_agent.previous_history",
-                BridgeClient.INSTANCE::hasHistory, BridgeClient.INSTANCE::previousHistory));
-        actionButtons.add(addAction("screen.autoftbq_agent.next_history",
-                BridgeClient.INSTANCE::isViewingHistory, BridgeClient.INSTANCE::nextHistory));
+                BridgeClient.INSTANCE::canPauseRequest,
+                BridgeClient.INSTANCE::isBusy, BridgeClient.INSTANCE::togglePauseRequest));
         actionButtons.add(addAction("screen.autoftbq_agent.undo_short",
-                () -> canEditNow() && BridgeClient.INSTANCE.canUndo(), BridgeClient.INSTANCE::undoLastProposal));
+                () -> canEditNow() && BridgeClient.INSTANCE.canUndo(),
+                BridgeClient.INSTANCE::canUndo, BridgeClient.INSTANCE::undoLastProposal));
+        actionButtons.add(addAction("screen.autoftbq_agent.more",
+                () -> true, () -> true, () -> {
+                    extraActionsVisible = !extraActionsVisible;
+                    alignWidgets();
+                }));
+
+        actionButtons.add(addAction("screen.autoftbq_agent.sketch",
+                () -> canEditNow() && !BridgeClient.INSTANCE.isBusy(),
+                () -> extraActionsVisible && !BridgeClient.INSTANCE.isBusy(),
+                () -> Minecraft.getInstance().setScreen(
+                        new dev.autoftbq.agent.client.LayoutSketchScreen(Minecraft.getInstance().screen))));
+        actionButtons.add(addAction("screen.autoftbq_agent.previous_history",
+                BridgeClient.INSTANCE::hasHistory,
+                () -> extraActionsVisible && BridgeClient.INSTANCE.hasHistory(),
+                BridgeClient.INSTANCE::previousHistory));
+        actionButtons.add(addAction("screen.autoftbq_agent.next_history",
+                BridgeClient.INSTANCE::isViewingHistory,
+                () -> extraActionsVisible && BridgeClient.INSTANCE.hasHistory(),
+                BridgeClient.INSTANCE::nextHistory));
         actionButtons.add(addAction("screen.autoftbq_agent.copy_short",
                 () -> !BridgeClient.INSTANCE.result().isBlank(),
+                () -> extraActionsVisible && !BridgeClient.INSTANCE.result().isBlank(),
                 () -> Widget.setClipboardString(BridgeClient.INSTANCE.result())));
         actionButtons.add(addAction("screen.autoftbq_agent.clear_context_short",
-                () -> !AgentContextSelection.isEmpty(), this::clearContext));
+                () -> !AgentContextSelection.isEmpty(),
+                () -> extraActionsVisible && !AgentContextSelection.isEmpty(), this::clearContext));
     }
 
     private DockButton addAction(String translationKey, BooleanSupplier enabled,
-                                 Runnable action) {
+                                 BooleanSupplier visible, Runnable action) {
         DockButton button = new DockButton(this, Component.translatable(translationKey),
-                enabled, action);
+                enabled, visible, action);
         add(button);
         return button;
     }
@@ -116,6 +133,13 @@ public final class FTBQ2001AgentDockPanel extends Panel {
         return ClientQuestFile.INSTANCE != null && ClientQuestFile.INSTANCE.canEdit();
     }
 
+    private void refreshPromptHint() {
+        if (prompt == null) return;
+        prompt.ghostText = Component.translatable(canEditNow()
+                ? "screen.autoftbq_agent.prompt_hint"
+                : "screen.autoftbq_agent.prompt_read_only_hint").getString();
+    }
+
     private void clearContext() {
         AgentContextSelection.clear();
         selectionKey = "";
@@ -127,26 +151,32 @@ public final class FTBQ2001AgentDockPanel extends Panel {
         int innerWidth = Math.max(120, width - 16);
         int gap = 3;
         int columns = innerWidth >= 340 ? 4 : 3;
-        int rows = Math.max(1, (actionButtons.size() + columns - 1) / columns);
-        int buttonsTop = Math.max(106, height - 8 - rows * 23);
-        int promptY = Math.max(80, buttonsTop - 26);
-        transcript.setPosAndSize(8, 55, innerWidth,
-                Math.max(20, promptY - 61));
+        List<DockButton> visibleButtons = new ArrayList<>();
+        for (DockButton button : actionButtons) {
+            if (button.shouldDraw()) visibleButtons.add(button);
+        }
+        int rows = Math.max(1, (visibleButtons.size() + columns - 1) / columns);
+        int buttonsTop = Math.max(118, height - 8 - rows * 23);
+        int promptY = Math.max(92, buttonsTop - 26);
+        int transcriptTop = 64;
+        transcript.setPosAndSize(8, transcriptTop, innerWidth,
+                Math.max(20, promptY - transcriptTop - 6));
         prompt.setPosAndSize(8, promptY, innerWidth, 20);
 
         int buttonWidth = Math.max(48, (innerWidth - gap * (columns - 1)) / columns);
-        for (int index = 0; index < actionButtons.size(); index++) {
+        for (int index = 0; index < visibleButtons.size(); index++) {
             int column = index % columns;
             int row = index / columns;
             int x = 8 + column * (buttonWidth + gap);
             int y = buttonsTop + row * 23;
-            actionButtons.get(index).setPosAndSize(x, y, buttonWidth, 20);
+            visibleButtons.get(index).setPosAndSize(x, y, buttonWidth, 20);
         }
     }
 
     @Override
     public void tick() {
         super.tick();
+        refreshPromptHint();
         String currentKey = currentSelectionKey();
         if (!currentKey.equals(selectionKey)) {
             selectionKey = currentKey;
@@ -179,18 +209,34 @@ public final class FTBQ2001AgentDockPanel extends Panel {
                 x + 10, y + 8, 0xFFFFFFFF, false);
         graphics.drawString(font, contextSummary(), x + 10, y + 23,
                 0xFFB8DCCB, false);
+
         String status = canEditNow() ? BridgeClient.INSTANCE.status()
-                : "等待编辑权限同步；当前仅可查看记录";
-        graphics.drawString(font, font.plainSubstrByWidth(status, Math.max(40, width - 20)),
-                x + 10, y + 38, 0xFFA8B5AE, false);
+                : Component.translatable("screen.autoftbq_agent.read_only_status").getString();
+        int statusColor = statusColor(status);
+        graphics.fill(x + 10, y + 39, x + 15, y + 44, statusColor);
+        graphics.drawString(font, font.plainSubstrByWidth(status, Math.max(40, width - 30)),
+                x + 20, y + 38, 0xFFA8B5AE, false);
+        graphics.drawString(font,
+                Component.translatable("screen.autoftbq_agent.mode_auto_apply"),
+                x + 10, y + 51, 0xFF82958B, false);
+    }
+
+    private int statusColor(String status) {
+        String lower = status.toLowerCase(java.util.Locale.ROOT);
+        if (status.contains("失败") || status.contains("未连接") || lower.contains("failed")) {
+            return 0xFFE36B6B;
+        }
+        if (BridgeClient.INSTANCE.isBusy()) return 0xFFE7C66A;
+        if (canEditNow()) return 0xFF55E6B1;
+        return 0xFFE6B855;
     }
 
     private String contextSummary() {
         int chapters = AgentContextSelection.chapterCount();
         int quests = AgentContextSelection.questCount();
         return chapters == 0 && quests == 0
-                ? Component.translatable("screen.autoftbq_agent.context_none").getString()
-                : Component.translatable("screen.autoftbq_agent.context_counts",
+                ? Component.translatable("screen.autoftbq_agent.context_auto").getString()
+                : Component.translatable("screen.autoftbq_agent.context_auto_pinned",
                 chapters, quests).getString();
     }
 
@@ -205,18 +251,25 @@ public final class FTBQ2001AgentDockPanel extends Panel {
 
     private static final class DockButton extends SimpleTextButton {
         private final BooleanSupplier enabled;
+        private final BooleanSupplier visible;
         private final Runnable action;
 
         private DockButton(Panel parent, Component title, BooleanSupplier enabled,
-                           Runnable action) {
+                           BooleanSupplier visible, Runnable action) {
             super(parent, title, Icon.empty());
             this.enabled = enabled;
+            this.visible = visible;
             this.action = action;
         }
 
         @Override
         public boolean isEnabled() {
             return enabled.getAsBoolean();
+        }
+
+        @Override
+        public boolean shouldDraw() {
+            return visible.getAsBoolean();
         }
 
         @Override
