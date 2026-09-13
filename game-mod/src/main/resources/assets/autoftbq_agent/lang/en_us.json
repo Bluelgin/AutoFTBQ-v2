@@ -35,6 +35,7 @@
   "screen.autoftbq_agent.pause_resume": "Pause/Resume",
   "screen.autoftbq_agent.read_only_status": "Read-only · waiting for FTBQ edit permission",
   "screen.autoftbq_agent.mode_auto_apply": "Mode: auto-apply changes · undo stays available afterwards",
+  "screen.autoftbq_agent.mode_read_only": "Mode: read-only · the quest book will not be modified",
   "screen.autoftbq_agent.edit_mode_required": "Open FTB Quests and enable editing mode first",
   "screen.autoftbq_agent.ftbq_required": "Enter a world and open FTB Quests first",
   "screen.autoftbq_agent.sketch_title": "Freehand layout · creates one new chapter",
