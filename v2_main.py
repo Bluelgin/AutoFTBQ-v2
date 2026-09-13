@@ -7,7 +7,7 @@ import sys
 if "--smoke-test" in sys.argv:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from autoftbq_v2.ui import run_app, smoke_test_app
+from autoftbq_v2.ux_polish import run_app, smoke_test_app
 
 
 if __name__ == "__main__":
