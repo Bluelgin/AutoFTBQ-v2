@@ -30,6 +30,7 @@ public final class FTBQ2001AgentDockPanel extends Panel {
     private TranscriptWidget transcript;
     private final List<DockButton> actionButtons = new ArrayList<>();
     private boolean extraActionsVisible;
+    private String actionLayoutKey = "";
     private String selectionKey = "";
     private int syncDelay = 1;
     private int studioTransactionPollDelay = 20;
@@ -85,7 +86,7 @@ public final class FTBQ2001AgentDockPanel extends Panel {
         actionButtons.add(addAction("screen.autoftbq_agent.more",
                 () -> true, () -> true, () -> {
                     extraActionsVisible = !extraActionsVisible;
-                    alignWidgets();
+                    refreshActionLayout(true);
                 }));
 
         actionButtons.add(addAction("screen.autoftbq_agent.sketch",
@@ -108,6 +109,7 @@ public final class FTBQ2001AgentDockPanel extends Panel {
         actionButtons.add(addAction("screen.autoftbq_agent.clear_context_short",
                 () -> !AgentContextSelection.isEmpty(),
                 () -> extraActionsVisible && !AgentContextSelection.isEmpty(), this::clearContext));
+        actionLayoutKey = "";
     }
 
     private DockButton addAction(String translationKey, BooleanSupplier enabled,
@@ -146,6 +148,16 @@ public final class FTBQ2001AgentDockPanel extends Panel {
         BridgeClient.INSTANCE.connectAndSync();
     }
 
+    private void refreshActionLayout(boolean force) {
+        StringBuilder key = new StringBuilder();
+        for (DockButton button : actionButtons) key.append(button.shouldDraw() ? '1' : '0');
+        String value = key.toString();
+        if (force || !value.equals(actionLayoutKey)) {
+            actionLayoutKey = value;
+            alignWidgets();
+        }
+    }
+
     @Override
     public void alignWidgets() {
         int innerWidth = Math.max(120, width - 16);
@@ -177,6 +189,7 @@ public final class FTBQ2001AgentDockPanel extends Panel {
     public void tick() {
         super.tick();
         refreshPromptHint();
+        refreshActionLayout(false);
         String currentKey = currentSelectionKey();
         if (!currentKey.equals(selectionKey)) {
             selectionKey = currentKey;
@@ -217,7 +230,9 @@ public final class FTBQ2001AgentDockPanel extends Panel {
         graphics.drawString(font, font.plainSubstrByWidth(status, Math.max(40, width - 30)),
                 x + 20, y + 38, 0xFFA8B5AE, false);
         graphics.drawString(font,
-                Component.translatable("screen.autoftbq_agent.mode_auto_apply"),
+                Component.translatable(canEditNow()
+                        ? "screen.autoftbq_agent.mode_auto_apply"
+                        : "screen.autoftbq_agent.mode_read_only"),
                 x + 10, y + 51, 0xFF82958B, false);
     }
 
