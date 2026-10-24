@@ -1,5 +1,10 @@
 # AutoFTBQ Studio
 
+> [!IMPORTANT]
+> **项目迁移公告（2026 年 10 月）**：AutoFTBQ Studio v2 的后续开发重心已转向 **[AutoFTBQ MCP](https://github.com/Bluelgin/AutoFTBQ-MCP)**。本仓库作为历史 Alpha 版本保留，不再作为新功能的主要开发分支。
+>
+> AutoFTBQ MCP 是独立的游戏内 Mod，让 Codex 等外部 AI Agent 通过 MCP 读取游戏与 FTB Quests 数据、编辑任务书。它不再依赖本仓库的 Studio 后端，**不是** Studio EXE 的原地升级，也不会自动迁移旧工作区。当前主要适配 Minecraft 1.20.1 / Forge 47.x / FTB Quests 2001.x，真实游戏内操作仍需自行验证；原 Studio 的离线编辑能力与历史代码继续保留。
+
 alpha.14：整本同步后按 FTBQ 登录流程补发服务器计算的编辑权限，修复刷新后 Agent 不可用；游戏面板新增“暂停/继续”，在模型/工具安全边界暂停，取消仍可用。通过本地校验的工具步骤按至少约 2 秒间隔合并提交，服务器回执和快照确认后继续生成，不等整段回答结束。已提交步骤成为新的本地回滚基线。撤销仍仅针对最近一批。需客户端、服务端及源码 Studio 同步更新；276 项 Python 测试和 Java 烟测通过，游戏内完整体验待验收。
 
 alpha.13 修复整本同步后旧 FTBQ 窗口仍绑定旧客户端任务书的问题：同步前保存视图，TeamData 就绪后在客户端主线程重建到新任务书，恢复输入草稿和仍存在的已查看任务；用户已关闭窗口时不强行重开。此轮不调整启动扫描或性能策略。客户端界面效果需游戏内验收。
@@ -20,7 +25,7 @@ AutoFTBQ Studio 是面向 FTB Quests 的离线编辑器与 AI Agent 工作台。
 
 游戏内的明确编辑要求本身就是执行授权，不需要再发送“确认”或“开始”。请求提交前会自动等待客户端与服务器任务书 revision 一致；模型完成核对但没有生成事务时，Studio 会自动续跑同一请求并直接准备可撤回修改。
 
-> 当前处于 Alpha 开发阶段。稳定版 1.x 仍在 [AutoFTBQ](https://github.com/Bluelgin/AutoFTBQ) 仓库维护；请先备份整合包和任务书后再测试 v2。
+> 本文以下内容是 Studio v2 Alpha 阶段的历史文档；v1 与 v2 均已停止作为主要开发方向，后续开发请前往 [AutoFTBQ MCP](https://github.com/Bluelgin/AutoFTBQ-MCP)。使用历史版本时请先备份整合包和任务书。
 
 游戏内 Mod 的安装、协议和真实世界验收分别见 [`game-mod/README.md`](game-mod/README.md)、[`docs/GAME_BRIDGE.md`](docs/GAME_BRIDGE.md) 和 [`docs/GAME_ACCEPTANCE.md`](docs/GAME_ACCEPTANCE.md)。
 
